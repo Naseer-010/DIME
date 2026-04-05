@@ -6,20 +6,14 @@ failure probability model, cascading failure triggers, and the
 dense reward function.
 """
 
-import math
 import random
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 from openenv.core.env_server.interfaces import Environment
-from openenv.core.env_server.types import Observation, State
 
-# Import from sibling package — works both standalone and in-repo
-try:
-    from models import InfraAction, InfraObservation, InfraState
-except ImportError:
-    from distributed_infra_env.models import InfraAction, InfraObservation, InfraState
+from server.models import InfraAction, InfraObservation, InfraState
 
 # Import tasks lazily to avoid circular imports
 _TASKS = None
@@ -28,10 +22,7 @@ _TASKS = None
 def _get_tasks():
     global _TASKS
     if _TASKS is None:
-        try:
-            from server.tasks import TASKS
-        except ImportError:
-            from distributed_infra_env.server.tasks import TASKS
+        from server.tasks import TASKS
         _TASKS = TASKS
     return _TASKS
 
@@ -85,7 +76,7 @@ class SimulationState:
 
 def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
     """Create a default mesh-like graph of n nodes."""
-    nodes = [Node(cpu_util = 0.25 + random.uniform(-0.05, 0.05)) for _ in range(n)]
+    nodes = [Node(cpu_util=0.25 + random.uniform(-0.05, 0.05)) for _ in range(n)]
 
     # Build connected graph: ring + some cross-links for redundancy
     adjacency: Dict[int, List[int]] = {i: [] for i in range(n)}

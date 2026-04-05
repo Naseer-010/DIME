@@ -3,7 +3,7 @@ Pydantic v2 typed Action and Observation models for the
 Distributed Infrastructure Management Environment.
 """
 
-from typing import Any, Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional
 
 from openenv.core.env_server.types import Action, Observation, State
 from pydantic import Field, model_validator

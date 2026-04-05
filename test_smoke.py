@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
 """Smoke test: directly instantiate the environment and run all 3 tasks."""
-import sys, os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "distributed_infra_env"))
 
-from distributed_infra_env.server.environment import DistributedInfraEnvironment
-from distributed_infra_env.models import InfraAction, InfraObservation
+from server.environment import DistributedInfraEnvironment
+from server.models import InfraAction, InfraObservation
+
 
 def test_task(task_id: str):
     print(f"\n--- Testing task: {task_id} ---")
@@ -62,6 +60,7 @@ def test_task(task_id: str):
     print(f"  Task score: {score:.4f}")
 
     print(f"  PASSED: {task_id}")
+
 
 if __name__ == "__main__":
     for task in ["traffic_spike", "node_failure", "cascading_failure"]:

@@ -11,12 +11,12 @@ The environment models a weighted graph of **8 compute nodes** with realistic di
 | Field          | Type          | Description                                       |
 |----------------|---------------|---------------------------------------------------|
 | `cpu_loads`    | `list[float]` | CPU utilization [0.0, 1.0] per node               |
-| `queue_lengths`| `list[int]`   | Pending request count per node                     |
-| `failed_nodes` | `list[int]`   | Indices of currently failed nodes                  |
-| `latency_ms`  | `float`       | Rolling average end-to-end latency in ms           |
-| `request_rate` | `float`       | Incoming requests per second                       |
-| `step`         | `int`         | Current step within the episode                    |
-| `task_hint`    | `str`         | Natural language description of current objective  |
+| `queue_lengths`| `list[int]`   | Pending request count per node                    |
+| `failed_nodes` | `list[int]`   | Indices of currently failed nodes                 |
+| `latency_ms`   | `float`       |Rolling average end-to-end latency in ms          |
+| `request_rate` | `float`       | Incoming requests per second                      |
+| `step`         | `int`         | Current step within the episode                   |
+| `task_hint`    | `str`         | Natural language description of current objective |
 
 ## Action Space
 
@@ -25,8 +25,8 @@ The environment models a weighted graph of **8 compute nodes** with realistic di
 | `restart_node`   | `target: int`                       | Brings failed node back online (2-step delay)   |
 | `reroute_traffic`| `from_node: int`, `to_node: int`    | Shifts 30% of load between nodes                |
 | `scale_up`       | —                                   | Adds temporary capacity node for 10 steps       |
-| `throttle`       | `rate: float [0, 1]`               | Reduces incoming request acceptance rate         |
-| `no_op`          | —                                   | Do nothing (passive observation step)            |
+| `throttle`       | `rate: float [0, 1]`                | Reduces incoming request acceptance rate        |
+| `no_op`          | —                                   | Do nothing (passive observation step)           |
 
 ## Graded Tasks
 
@@ -55,10 +55,13 @@ R(t) = 0.40 × uptime_ratio
 
 ```bash
 # Install dependencies
-pip install -e .
+pip install -r requirements.txt
 
 # Start the server
 uvicorn server.app:app --host 0.0.0.0 --port 8000
+
+# Run smoke test
+python test_smoke.py
 
 # Run the LLM agent
 export HF_TOKEN=hf_xxxxx
@@ -69,7 +72,7 @@ python inference.py
 
 ```bash
 # Build
-docker build -t distributed-infra-env -f server/Dockerfile .
+docker build -t distributed-infra-env .
 
 # Run
 docker run -p 8000:8000 distributed-infra-env
@@ -87,10 +90,10 @@ docker run -p 8000:8000 distributed-infra-env
 
 | Component       | Technology                                      |
 |----------------|--------------------------------------------------|
-| HTTP Server    | FastAPI                                           |
-| Data Models    | Pydantic v2                                       |
-| Simulation     | Pure Python (node graph, load redistribution)     |
-| Containerization | Docker                                          |
+| HTTP Server    | FastAPI                                          |
+| Data Models    | Pydantic v2                                      |
+| Simulation     | Pure Python (node graph, load redistribution)    |
+| Containerization | Docker                                         |
 | Deployment     | HuggingFace Spaces                               |
 | LLM Interface  | OpenAI-compatible client → HF Inference API      |
-| LLM Model      | meta-llama/Llama-3.1-8B-Instruct                |
+| LLM Model      | meta-llama/Llama-3.1-8B-Instruct                 |

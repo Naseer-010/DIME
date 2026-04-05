@@ -3,7 +3,7 @@
 LLM Agent Inference Loop for Distributed Infrastructure Environment.
 
 Runs the LLM agent against all 3 graded tasks and reports scores.
-Uses the OpenAI Python Client to interact with the HuggingFace Inference API.
+Uses the OpenAI-compatible client pointing at HuggingFace Inference API.
 
 Environment variables:
     API_BASE_URL — inference endpoint (default: HF Inference API)
@@ -13,10 +13,9 @@ Environment variables:
 
 import json
 import os
-import sys
 import time
+
 import requests
-from openai import OpenAI
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -24,7 +23,7 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get(
     "API_BASE_URL",
-    "https://router.huggingface.co/hf-inference/v1",
+    "https://router.huggingface.co/hf-inference/models",
 )
 MODEL_NAME = os.environ.get(
     "MODEL_NAME",
@@ -38,45 +37,35 @@ ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
 TASKS = ["traffic_spike", "node_failure", "cascading_failure"]
 MAX_RETRIES = 3
 
-# Initialize the OpenAI client for LLM calls
-client = OpenAI(
-    base_url=API_BASE_URL,
-    api_key=HF_TOKEN if HF_TOKEN else "hf_placeholder"
-)
-
 # ---------------------------------------------------------------------------
-# System prompt for the LLM agent (GOD-MODE)
+# System prompt for the LLM agent
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE).
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a distributed compute cluster.
+
 You receive observations about the system state as JSON and must respond with a single action as JSON.
 
 Available actions:
-- {"action_type": "restart_node", "target": <int>}
-- {"action_type": "reroute_traffic", "from_node": <int>, "to_node": <int>}
-- {"action_type": "scale_up"}
-- {"action_type": "throttle", "rate": <float>}
-- {"action_type": "no_op"}
+1. {"action_type": "restart_node", "target": <node_index>}  — Restart a failed node (takes 2 steps to come online)
+2. {"action_type": "reroute_traffic", "from_node": <source>, "to_node": <dest>}  — Shift 30% of load from source to destination
+3. {"action_type": "scale_up"}  — Add a temporary capacity node for 10 steps
+4. {"action_type": "throttle", "rate": <0.0-1.0>}  — Reduce incoming request acceptance rate
+5. {"action_type": "no_op"}  — Do nothing this step
 
-CRITICAL DECISION TREE (Follow strictly):
-1. IF 'failed_nodes' is not empty: 
-   IMMEDIATELY output {"action_type": "restart_node", "target": <failed_node_index>}
-2. IF any node in 'cpu_loads' is > 0.85:
-   Find the node with the highest CPU (e.g., node 4) and the node with the lowest CPU (e.g., node 1). 
-   Output {"action_type": "reroute_traffic", "from_node": 4, "to_node": 1}
-3. IF average 'cpu_loads' > 0.70 AND no nodes are failing:
-   Output {"action_type": "scale_up"}
-4. IF 'latency_ms' > 45.0:
-   Output {"action_type": "throttle", "rate": 0.8}
-5. IF none of the above are true:
-   Output {"action_type": "no_op"}
+Key rules:
+- A node at >90% CPU for 3 consecutive steps will FAIL — act before this happens
+- Failed node load cascades to neighbors, potentially causing chain failures
+- Restarting takes 2 steps — plan ahead
+- Minimize unnecessary actions (over-intervention is penalized)
+- Read the task_hint carefully for specific objectives
 
-Respond with ONLY a valid JSON action object. No markdown formatting, and no other text."""
+Respond with ONLY a valid JSON action object, no other text."""
 
 
 # ---------------------------------------------------------------------------
 # LLM Decision Function
 # ---------------------------------------------------------------------------
+
 
 def llm_decide(observation: dict) -> dict:
     """Send observation to LLM and get an action decision."""
@@ -87,21 +76,31 @@ def llm_decide(observation: dict) -> dict:
 
 Analyze the system state and decide the best action. Respond with ONLY a JSON action object."""
 
+    url = f"{API_BASE_URL}/{MODEL_NAME}/v1/chat/completions"
+
+    headers = {"Content-Type": "application/json"}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt},
+        ],
+        "max_tokens": 200,
+        "temperature": 0.3,
+    }
+
     for attempt in range(MAX_RETRIES):
         try:
-            response = client.chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=150,
-                temperature=0.01, # Extremely low temperature to prevent hallucination
-            )
+            response = requests.post(url, json=payload, headers=headers, timeout=30)
+            response.raise_for_status()
+            result = response.json()
 
-            content = response.choices[0].message.content.strip()
+            content = result["choices"][0]["message"]["content"].strip()
 
-            # Extract JSON from response (handle markdown code blocks if the LLM hallucinates them)
+            # Extract JSON from response (handle markdown code blocks)
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0].strip()
             elif "```" in content:
@@ -110,7 +109,7 @@ Analyze the system state and decide the best action. Respond with ONLY a JSON ac
             action = json.loads(content)
             return action
 
-        except Exception as e:
+        except (requests.RequestException, json.JSONDecodeError, KeyError) as e:
             print(f"  [Attempt {attempt + 1}] LLM call failed: {e}")
             if attempt == MAX_RETRIES - 1:
                 print("  Falling back to no_op")
@@ -123,6 +122,7 @@ Analyze the system state and decide the best action. Respond with ONLY a JSON ac
 # ---------------------------------------------------------------------------
 # Environment Interaction
 # ---------------------------------------------------------------------------
+
 
 def env_reset(task_id: str) -> dict:
     """Reset the environment with a specific task."""
@@ -151,14 +151,12 @@ def env_step(action: dict) -> dict:
 # Main Loop
 # ---------------------------------------------------------------------------
 
+
 def run_task(task_id: str) -> float:
     """Run one task and return the final score."""
     print(f"\n{'='*60}")
     print(f"  Task: {task_id}")
     print(f"{'='*60}")
-
-    # --- REQUIRED TAG FOR AUTO-EVALUATOR ---
-    print(f"[START] Task {task_id} initialized.")
 
     obs = env_reset(task_id)
     print(f"  Initial observation: {len(obs.get('cpu_loads', []))} nodes")
@@ -168,15 +166,9 @@ def run_task(task_id: str) -> float:
     step = 0
 
     while True:
-        # LLM decides action
         action = llm_decide(obs)
         action_type = action.get("action_type", "no_op")
 
-        # --- REQUIRED TAG FOR AUTO-EVALUATOR ---
-        # The auto-evaluator expects the action payload string
-        print(f"[STEP] {json.dumps(action)}")
-
-        # Execute action
         result = env_step(action)
 
         obs = result.get("observation", result)
@@ -187,7 +179,6 @@ def run_task(task_id: str) -> float:
         total_reward += reward if reward else 0.0
         step += 1
 
-        # Progress logging (for human debugging)
         cpu_loads = obs.get("cpu_loads", [])
         avg_cpu = sum(cpu_loads) / len(cpu_loads) if cpu_loads else 0
         failed = obs.get("failed_nodes", [])
@@ -204,18 +195,11 @@ def run_task(task_id: str) -> float:
             print(f"\n  Episode complete!")
             print(f"  Total reward:  {total_reward:+.4f}")
             print(f"  Task score:    {task_score:.4f}")
-            
-            # --- REQUIRED TAG FOR AUTO-EVALUATOR ---
-            print(f"[END] Task {task_id} completed. Final Score: {task_score:.4f}")
             return task_score
 
-        if step > 100:  # Safety limit
+        if step > 100:
             print("  [!] Safety limit reached, ending episode")
-            task_score = metadata.get("task_score", 0.0)
-            
-            # Ensure END tag fires even on a timeout
-            print(f"[END] Task {task_id} completed (TIMEOUT). Final Score: {task_score:.4f}")
-            return task_score
+            return metadata.get("task_score", 0.0)
 
 
 def main():
@@ -238,9 +222,7 @@ def main():
         except Exception as e:
             print(f"\n  [ERROR] Task {task_id} failed: {e}")
             scores[task_id] = 0.0
-            print(f"[END] Task {task_id} failed with error. Final Score: 0.0000")
 
-    # Final report
     print("\n" + "=" * 60)
     print("  FINAL SCORES")
     print("=" * 60)
@@ -252,7 +234,6 @@ def main():
     print(f"\n  Average score: {avg:.4f}")
     print("=" * 60)
 
-    # Output structured JSON for automated evaluation
     print("\n" + json.dumps(scores, indent=2))
 
     return scores

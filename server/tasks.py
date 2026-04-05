@@ -71,13 +71,8 @@ def _setup_node_failure(env: "DistributedInfraEnvironment", rng: "random.Random"
     sim.current_request_rate = sim.base_request_rate * 1.5
 
     # Mark node 3 for pre-programmed failure
-    # We set its CPU to spike later — handled in a scheduled event
     sim.nodes[3].cpu_util = 0.60
     sim.nodes[3].queue_length = 20
-
-    # Store the target failure step in a way the environment can check
-    # We use a simple approach: set the node to fail immediately when step == 5
-    # This is handled by checking in is_done and via a simulation hook
 
 
 def _grade_node_failure(env: "DistributedInfraEnvironment") -> float:
@@ -89,11 +84,7 @@ def _grade_node_failure(env: "DistributedInfraEnvironment") -> float:
     if not sim.uptime_history:
         return 0.0
 
-    # Check if node 3 ever failed and was recovered
-    node_3_failed = sim.nodes[3].is_failed if 3 < len(sim.nodes) else True
-
     # MTTR: how quickly system recovered from the failure
-    # Find the first step where uptime dropped and when it recovered
     failure_duration = 0
     in_failure = False
     for uptime in sim.uptime_history:
@@ -103,7 +94,7 @@ def _grade_node_failure(env: "DistributedInfraEnvironment") -> float:
         elif in_failure:
             break
 
-    max_failure_window = 10  # optimal recovery within 10 steps
+    max_failure_window = 10
     mttr_score = max(0.0, 1.0 - failure_duration / max_failure_window)
 
     # Uptime component: fraction of steps with >80% uptime
@@ -143,7 +134,7 @@ def _setup_cascading_failure(env: "DistributedInfraEnvironment", rng: "random.Ra
     # Put nodes 1 and 4 near critical
     sim.nodes[1].cpu_util = 0.88
     sim.nodes[1].queue_length = 30
-    sim.nodes[1].high_cpu_streak = 2  # One more step at >90% = failure
+    sim.nodes[1].high_cpu_streak = 2
 
     sim.nodes[4].cpu_util = 0.86
     sim.nodes[4].queue_length = 25
@@ -163,12 +154,9 @@ def _grade_cascading_failure(env: "DistributedInfraEnvironment") -> float:
     """
     sim = env.sim
 
-    # Cascade prevention: bonus if no cascade occurred
     cascade_score = 1.0 if not sim.cascade_occurred else 0.3
 
-    # CPU health: average fraction of nodes below 85% across all steps
     if sim.uptime_history:
-        # We use uptime as a proxy; also check current state
         healthy_now = sum(
             1 for n in sim.nodes
             if not n.is_failed and n.cpu_util < 0.85
@@ -178,7 +166,6 @@ def _grade_cascading_failure(env: "DistributedInfraEnvironment") -> float:
     else:
         cpu_score = 0.0
 
-    # Action efficiency: ratio of actions to max
     max_reasonable = sim.max_steps * 0.4
     efficiency = max(0.0, 1.0 - sim.actions_taken / max(1, max_reasonable))
 
@@ -188,7 +175,6 @@ def _grade_cascading_failure(env: "DistributedInfraEnvironment") -> float:
 
 def _is_done_cascading_failure(env: "DistributedInfraEnvironment") -> bool:
     sim = env.sim
-    # Early termination if more than half the nodes have failed (total cascade)
     failed_count = sum(1 for n in sim.nodes if n.is_failed)
     if failed_count > len(sim.nodes) // 2:
         return True
