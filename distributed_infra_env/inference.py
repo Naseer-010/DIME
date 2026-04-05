@@ -45,38 +45,33 @@ client = OpenAI(
 )
 
 # ---------------------------------------------------------------------------
-# System prompt for the LLM agent
+# System prompt for the LLM agent (GOD-MODE)
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a distributed compute cluster.
-
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE).
 You receive observations about the system state as JSON and must respond with a single action as JSON.
 
 Available actions:
-1. {"action_type": "restart_node", "target": <node_index>}  — Restart a failed node (takes 2 steps to come online)
-2. {"action_type": "reroute_traffic", "from_node": <source>, "to_node": <dest>}  — Shift 30% of load from source to destination
-3. {"action_type": "scale_up"}  — Add a temporary capacity node for 10 steps
-4. {"action_type": "throttle", "rate": <0.0-1.0>}  — Reduce incoming request acceptance rate
-5. {"action_type": "no_op"}  — Do nothing this step
+- {"action_type": "restart_node", "target": <int>}
+- {"action_type": "reroute_traffic", "from_node": <int>, "to_node": <int>}
+- {"action_type": "scale_up"}
+- {"action_type": "throttle", "rate": <float>}
+- {"action_type": "no_op"}
 
-Key rules:
-- A node at >90% CPU for 3 consecutive steps will FAIL — act before this happens
-- Failed node load cascades to neighbors, potentially causing chain failures
-- Restarting takes 2 steps — plan ahead
-- Minimize unnecessary actions (over-intervention is penalized)
-- Read the task_hint carefully for specific objectives
+CRITICAL DECISION TREE (Follow strictly):
+1. IF 'failed_nodes' is not empty: 
+   IMMEDIATELY output {"action_type": "restart_node", "target": <failed_node_index>}
+2. IF any node in 'cpu_loads' is > 0.85:
+   Find the node with the highest CPU (e.g., node 4) and the node with the lowest CPU (e.g., node 1). 
+   Output {"action_type": "reroute_traffic", "from_node": 4, "to_node": 1}
+3. IF average 'cpu_loads' > 0.70 AND no nodes are failing:
+   Output {"action_type": "scale_up"}
+4. IF 'latency_ms' > 45.0:
+   Output {"action_type": "throttle", "rate": 0.8}
+5. IF none of the above are true:
+   Output {"action_type": "no_op"}
 
-EXAMPLES:
-If node 2 is failed, output exactly:
-{"action_type": "restart_node", "target": 2}
-
-If you want to move load from overloaded node 4 to healthy node 1, output exactly:
-{"action_type": "reroute_traffic", "from_node": 4, "to_node": 1}
-
-If nodes are stable and you just need to wait, output exactly:
-{"action_type": "no_op"}
-
-Respond with ONLY a valid JSON action object, no markdown formatting, and no other text."""
+Respond with ONLY a valid JSON action object. No markdown formatting, and no other text."""
 
 
 # ---------------------------------------------------------------------------
@@ -100,8 +95,8 @@ Analyze the system state and decide the best action. Respond with ONLY a JSON ac
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=200,
-                temperature=0.3,
+                max_tokens=150,
+                temperature=0.01, # Extremely low temperature to prevent hallucination
             )
 
             content = response.choices[0].message.content.strip()
