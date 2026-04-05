@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "distributed-infra-env"
+version = "0.1.0"
+description = "Distributed Infrastructure Management Environment for OpenEnv — LLM agent manages compute cluster with cascading failure dynamics"
+requires-python = ">=3.10"
+dependencies = [
+    # Core OpenEnv dependencies
+    "openenv-core[core]>=0.2.2",
+    "fastapi>=0.115.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.24.0",
+    "requests>=2.31.0",
+    # LLM inference
+    "openai>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-cov>=4.0.0",
+    "httpx>=0.25.0",
+]
+
+[project.scripts]
+server = "distributed_infra_env.server.app:main"
+
+[tool.setuptools]
+include-package-data = true
+packages = ["distributed_infra_env", "distributed_infra_env.server"]
+package-dir = { "distributed_infra_env" = ".", "distributed_infra_env.server" = "server" }
