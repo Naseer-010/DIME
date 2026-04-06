@@ -24,7 +24,7 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get(
     "API_BASE_URL",
-    "https://router.huggingface.co/hf-inference/v1",
+    "https://router.huggingface.co/v1",  
 )
 MODEL_NAME = os.environ.get(
     "MODEL_NAME",
@@ -132,8 +132,13 @@ def env_reset(task_id: str) -> dict:
         timeout=10,
     )
     response.raise_for_status()
-    data = response.json()
-    return data.get("observation", data)
+    payload = response.json()
+    
+    # ROBUST PAYLOAD UNWRAPPING
+    data_block = payload.get("data", payload)
+    if "observation" in data_block and isinstance(data_block["observation"], dict):
+        return data_block["observation"]
+    return data_block
 
 
 def env_step(action: dict) -> dict:
@@ -178,10 +183,17 @@ def run_task(task_id: str) -> float:
         # Execute action
         result = env_step(action)
 
-        obs = result.get("observation", result)
-        reward = result.get("reward", obs.get("reward", 0.0))
-        done = result.get("done", obs.get("done", False))
-        metadata = obs.get("metadata", {})
+        # ROBUST PAYLOAD UNWRAPPING
+        data_block = result.get("data", result)
+        
+        if "observation" in data_block and isinstance(data_block["observation"], dict):
+            obs = data_block["observation"]
+        else:
+            obs = data_block
+
+        reward = data_block.get("reward", obs.get("reward", 0.0))
+        done = data_block.get("done", obs.get("done", False))
+        metadata = data_block.get("metadata", obs.get("metadata", {}))
 
         total_reward += reward if reward else 0.0
         step += 1
