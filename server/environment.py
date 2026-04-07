@@ -236,11 +236,7 @@ class DistributedInfraEnvironment(Environment):
         obs = self._make_observation()
         obs.reward = reward
         obs.done = done
-        obs.metadata = {
-            "task_score": task_score,
-            "uptime_ratio": uptime_ratio,
-            "actions_taken": sim.actions_taken,
-        }
+        obs.task_score = task_score
 
         return obs
 

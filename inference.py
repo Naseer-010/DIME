@@ -126,6 +126,9 @@ def run_task(task_id: str) -> float:
 
     step = 0
     rewards_list = []
+    
+    # Initialize task_score outside the loop so we always have a value 
+    # even if the loop breaks early or errors out.
     task_score = 0.0
 
     while True:
@@ -140,6 +143,7 @@ def run_task(task_id: str) -> float:
         done = False
 
         try:
+            # ---> THE CHANGES YOU ASKED ABOUT ARE HERE <---
             result = env_step(action)
             data_block = result.get("data", result)
             
@@ -150,8 +154,9 @@ def run_task(task_id: str) -> float:
 
             reward = float(data_block.get("reward", obs.get("reward", 0.0)))
             done = bool(data_block.get("done", obs.get("done", False)))
-            metadata = data_block.get("metadata", obs.get("metadata", {}))
-            task_score = metadata.get("task_score", 0.0)
+            
+            # This continuously updates the task_score on every single step.
+            task_score = float(obs.get("task_score", 0.0))
 
         except Exception as e:
             error_msg = str(e).replace("\n", " ") # Prevent newline breaks in STDOUT
@@ -160,8 +165,10 @@ def run_task(task_id: str) -> float:
         rewards_list.append(reward)
         log_step(step=step, action=action_str, reward=reward, done=done, error=error_msg)
 
+        # Even if step > 100 hits (timeout failure), task_score has the partial credit from the last step!
         if done or step > 100:
-            success = task_score >= 0.1 # Defining threshold for success
+            # Define success: Let's say getting more than 0.1 points counts as partial success
+            success = task_score >= 0.1 
             log_end(success=success, steps=step, score=task_score, rewards=rewards_list)
             return task_score
 

@@ -86,6 +86,9 @@ class InfraObservation(Observation):
     task_hint: str = Field(
         description="Natural language description of the current task objective."
     )
+    task_score: float = Field(
+        default=0.0, description="Current grader score"
+    )
 
 
 class InfraState(State):
