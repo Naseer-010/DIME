@@ -10,19 +10,26 @@ from openenv.core.env_server.http_server import create_app
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 
+# --- THE FIX: The Singleton Factory Pattern ---
+# 1. Create the environment instance in memory once
+_global_env = DistributedInfraEnvironment()
+
+# 2. Create a "factory function" that returns our active instance
+def env_factory():
+    return _global_env
+
+# 3. Pass the callable factory function to OpenEnv
 app = create_app(
-    DistributedInfraEnvironment,
+    env_factory,
     InfraAction,
     InfraObservation,
     env_name="distributed_infra_env",
 )
 
-
 def main():
     """Entry point for direct execution."""
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
-
 
 if __name__ == "__main__":
     main()
