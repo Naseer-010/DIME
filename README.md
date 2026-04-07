@@ -1,3 +1,12 @@
+---
+title: DIME
+emoji: 🚀
+colorFrom: blue
+colorTo: red
+sdk: docker
+pinned: false
+---
+
 # DIME — Distributed Infrastructure Management Environment
 
 > A high-fidelity simulated distributed system for training and evaluating LLM agents on complex Site Reliability Engineering (SRE) tasks. Built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework.
