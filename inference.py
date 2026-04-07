@@ -22,7 +22,7 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 HF_TOKEN = os.environ.get("HF_TOKEN", os.environ.get("API_KEY", ""))
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
 
-TASKS = ["traffic_spike", "node_failure", "cascading_failure"]
+TASKS = ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]
 MAX_RETRIES = 3
 BENCHMARK = "distributed_infra_env"
 

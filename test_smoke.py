@@ -63,6 +63,6 @@ def test_task(task_id: str):
 
 
 if __name__ == "__main__":
-    for task in ["traffic_spike", "node_failure", "cascading_failure"]:
+    for task in ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]:
         test_task(task)
     print("\n=== ALL SMOKE TESTS PASSED ===")

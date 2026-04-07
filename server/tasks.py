@@ -182,6 +182,46 @@ def _is_done_cascading_failure(env: "DistributedInfraEnvironment") -> bool:
 
 
 # ============================================================================
+# Task 4 — Expert: Flash Crowd
+# ============================================================================
+
+def _setup_flash_crowd(env: "DistributedInfraEnvironment", rng: "random.Random"):
+    """Massive 5x traffic spike. Agent must scale up AND throttle to survive."""
+    sim = env.sim
+    sim.current_request_rate = sim.base_request_rate * 5.0
+    sim.max_steps = 40
+    for node in sim.nodes:
+        node.cpu_util = 0.60 + rng.uniform(-0.05, 0.1)
+        node.queue_length = rng.randint(15, 30)
+
+def _grade_flash_crowd(env: "DistributedInfraEnvironment") -> float:
+    """
+    Score = Survival Uptime (50%) + Latency control (50%).
+    Cascade penalty applied if the system collapses.
+    """
+    sim = env.sim
+    
+    avg_uptime = sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 0.0
+    
+    # Latency target is more generous for a massive flash crowd (100ms)
+    target = 100.0  
+    below_target = sum(1 for lat in sim.latency_history if lat < target)
+    latency_score = below_target / len(sim.latency_history) if sim.latency_history else 0.0
+
+    cascade_penalty = 0.4 if sim.cascade_occurred else 0.0
+
+    score = 0.50 * avg_uptime + 0.50 * latency_score - cascade_penalty
+    return round(min(1.0, max(0.0, score)), 4)
+
+def _is_done_flash_crowd(env: "DistributedInfraEnvironment") -> bool:
+    failed_count = sum(1 for n in env.sim.nodes if n.is_failed)
+    # Terminate early if more than 60% of the cluster dies
+    if failed_count > len(env.sim.nodes) * 0.6:
+        return True
+    return env.sim.step_count >= env.sim.max_steps
+
+
+# ============================================================================
 # Task Registry
 # ============================================================================
 
@@ -219,6 +259,17 @@ TASKS = {
             "chain reaction. ACT PROACTIVELY: reroute traffic away from hot nodes "
             "BEFORE they fail. Scaling up can help absorb excess load. "
             "Prevention is rewarded more than recovery."
+        ),
+    },
+    "flash_crowd": {
+        "setup": _setup_flash_crowd,
+        "grade": _grade_flash_crowd,
+        "is_done": _is_done_flash_crowd,
+        "hint": (
+            "FLASH CROWD: The system is facing an unprecedented 5x traffic surge. "
+            "Your objective is pure survival. You MUST aggressively use 'scale_up' "
+            "to add capacity AND use 'throttle' to drop excess traffic. "
+            "If you do not shed load, the cluster will collapse."
         ),
     },
 }
