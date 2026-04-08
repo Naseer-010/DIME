@@ -19,7 +19,9 @@ from openai import OpenAI
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-HF_TOKEN = os.environ.get("HF_TOKEN", os.environ.get("API_KEY", ""))
+
+# FIX: API_KEY must be checked FIRST!
+API_KEY = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "hf_placeholder"))
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
 
 TASKS = ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]
@@ -28,7 +30,7 @@ BENCHMARK = "distributed_infra_env"
 
 client = OpenAI(
     base_url=API_BASE_URL,
-    api_key=HF_TOKEN if HF_TOKEN else "hf_placeholder"
+    api_key=API_KEY
 )
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE).
@@ -57,7 +59,7 @@ CRITICAL DECISION TREE (Follow strictly):
 Respond with ONLY a valid JSON action object. No markdown formatting, and no other text."""
 
 # ---------------------------------------------------------------------------
-# Hackathon Required Logging Functions
+# Required Logging Functions
 # ---------------------------------------------------------------------------
 
 def log_start(task: str, env: str, model: str) -> None:
