@@ -68,9 +68,7 @@ class InfraObservation(Observation):
     cpu_loads: List[float] = Field(
         description="CPU utilization [0.0, 1.0] for each node."
     )
-    queue_lengths: List[int] = Field(
-        description="Number of pending requests per node."
-    )
+    queue_lengths: List[int] = Field(description="Number of pending requests per node.")
     failed_nodes: List[int] = Field(
         description="Indices of nodes currently in failed state."
     )
@@ -80,15 +78,11 @@ class InfraObservation(Observation):
     request_rate: float = Field(
         description="Incoming requests per second into the system."
     )
-    step: int = Field(
-        description="Current step within the episode."
-    )
+    step: int = Field(description="Current step within the episode.")
     task_hint: str = Field(
         description="Natural language description of the current task objective."
     )
-    task_score: float = Field(
-        default=0.0, description="Current grader score"
-    )
+    task_score: float = Field(default=0.01, description="Current grader score")
 
 
 class InfraState(State):
@@ -96,9 +90,7 @@ class InfraState(State):
     Internal environment state extending the base OpenEnv State.
     """
 
-    task_id: Optional[str] = Field(
-        default=None, description="Current task identifier."
-    )
+    task_id: Optional[str] = Field(default=None, description="Current task identifier.")
     task_score: float = Field(
-        default=0.0, description="Current task grader score [0.0, 1.0]."
+        default=0.01, description="Current task grader score in (0.0, 1.0) strictly."
     )
