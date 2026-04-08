@@ -18,11 +18,14 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
+
+API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
+if not API_KEY:
+    raise ValueError("API_KEY or HF_TOKEN environment variable is missing!")
+
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 
-# FIX: API_KEY must be checked FIRST!
-API_KEY = os.environ.get("API_KEY", os.environ.get("HF_TOKEN", "hf_placeholder"))
-ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
+ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:7860")
 
 TASKS = ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]
 MAX_RETRIES = 3
@@ -99,8 +102,12 @@ def llm_decide(observation: dict) -> dict:
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
             return json.loads(content)
-        except Exception:
+        except Exception as e:
+            # FIX: Print the actual error so it shows up in logs!
+            print(f"[DEBUG] LLM call attempt {attempt+1} failed: {str(e)}", flush=True)
             time.sleep(1)
+            
+    # If it fails all retries, return a no_op
     return {"action_type": "no_op"}
 
 def env_reset(task_id: str) -> dict:
