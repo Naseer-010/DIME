@@ -10,6 +10,7 @@ from openenv.core.env_server.http_server import create_app
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 from fastapi.responses import HTMLResponse
+import os
 
 # --- THE FIX: The Singleton Factory Pattern ---
 # 1. Create the environment instance in memory once
