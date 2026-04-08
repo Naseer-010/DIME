@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>DIME Environment</title>
+    <style>
+        body { font-family: 'Segoe UI', system-ui, -apple-system, sans-serif; background-color: #0f172a; color: #cbd5e1; line-height: 1.6; padding: 40px 20px; margin: 0; }
+        .container { max-width: 900px; margin: 0 auto; background-color: #1e293b; padding: 40px; border-radius: 12px; box-shadow: 0 10px 15px -3px rgba(0,0,0,0.5); }
+        h1, h2, h3 { color: #f8fafc; margin-top: 1.5em; }
+        h1 { color: #38bdf8; border-bottom: 2px solid #334155; padding-bottom: 10px; display: flex; align-items: center; gap: 15px; }
+        h2 { border-bottom: 1px solid #334155; padding-bottom: 8px; color: #e2e8f0; }
+        h3 { color: #94a3b8; }
+        p, li { font-size: 16px; }
+        ul { margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; margin: 25px 0; font-size: 15px; background-color: #0f172a; border-radius: 8px; overflow: hidden; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid #1e293b; }
+        th { background-color: #334155; color: #f8fafc; font-weight: 600; }
+        tr:last-child td { border-bottom: none; }
+        tr:hover { background-color: #1e293b; transition: background 0.2s; }
+        code { background-color: #0f172a; padding: 3px 6px; border-radius: 4px; font-family: 'Courier New', Courier, monospace; color: #38bdf8; font-size: 14px; border: 1px solid #334155; }
+        pre { background-color: #0f172a; padding: 20px; border-radius: 8px; overflow-x: auto; border: 1px solid #334155; }
+        pre code { background-color: transparent; padding: 0; border: none; color: #e2e8f0; }
+        .badge { background-color: #059669; color: white; padding: 6px 12px; border-radius: 999px; font-size: 12px; font-weight: bold; letter-spacing: 0.5px; }
+        .docs-btn { display: inline-block; margin-top: 10px; padding: 10px 20px; background-color: #2563eb; color: white; text-decoration: none; border-radius: 6px; font-weight: bold; transition: background 0.2s; }
+        .docs-btn:hover { background-color: #1d4ed8; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>
+            Distributed Infrastructure Management Environment (DIME)
+            <span class="badge">API ONLINE</span>
+        </h1>
+        <a href="/docs" class="docs-btn">View Interactive API Docs</a>
+
+        <h2>🚀 Overview & Motivation</h2>
+        <p>While many LLM environments focus on web browsing or puzzle games, there is a critical gap in evaluating an agent's ability to manage dynamic, real-world backend infrastructure. <strong>DIME</strong> models a mesh-topology graph of compute nodes experiencing realistic distributed systems dynamics.</p>
+        <p>An LLM agent must act as an automated SRE, observing system telemetry (CPU, queues, latency) and taking decisive management actions (routing, scaling, throttling) to maintain cluster stability and prevent catastrophic cascading failures.</p>
+
+        <h2>🧮 Simulation Dynamics & Mathematical Models</h2>
+        <ul>
+            <li><strong>Stochastic Traffic Formulation:</strong> Request arrivals are modeled using a variable-rate Gaussian distribution (approximating a Poisson process with burst potential) to simulate unpredictable real-world web traffic.</li>
+            <li><strong>Non-Linear Congestion (Latency):</strong> End-to-end latency is calculated using an exponential moving average (EMA). It incorporates base network delay, linear queue delay, and a <strong>non-linear (quadratic) CPU pressure penalty</strong> (<code>latency ∝ CPU²</code>).</li>
+            <li><strong>Stochastic & Deterministic Failures:</strong> Nodes fail deterministically if sustained above 90% CPU for 3 consecutive steps. However, they also face a <strong>probabilistic risk of failure</strong> when operating under heavy load (>85% CPU), simulating hardware degradation.</li>
+            <li><strong>Cascading Load Redistribution:</strong> When a node dies, its load and pending queues are violently redistributed to its adjacent neighbors in the mesh graph, actively simulating the physics of a cascading cluster collapse.</li>
+        </ul>
+
+        <h2>👁️ Observation Space</h2>
+        <table>
+            <thead><tr><th>Field</th><th>Type</th><th>Description</th></tr></thead>
+            <tbody>
+                <tr><td><code>cpu_loads</code></td><td><code>list[float]</code></td><td>CPU utilization [0.0, 1.0] per node</td></tr>
+                <tr><td><code>queue_lengths</code></td><td><code>list[int]</code></td><td>Pending request count per node</td></tr>
+                <tr><td><code>failed_nodes</code></td><td><code>list[int]</code></td><td>Indices of currently failed nodes</td></tr>
+                <tr><td><code>latency_ms</code></td><td><code>float</code></td><td>Rolling average end-to-end latency in ms</td></tr>
+                <tr><td><code>request_rate</code></td><td><code>float</code></td><td>Incoming requests per second</td></tr>
+                <tr><td><code>step</code></td><td><code>int</code></td><td>Current step within the episode</td></tr>
+                <tr><td><code>task_score</code></td><td><code>float</code></td><td>Real-time partial credit grader score</td></tr>
+                <tr><td><code>task_hint</code></td><td><code>str</code></td><td>Natural language description of current objective</td></tr>
+            </tbody>
+        </table>
+
+        <h2>🕹️ Action Space</h2>
+        <table>
+            <thead><tr><th>Action</th><th>Parameters</th><th>Effect</th></tr></thead>
+            <tbody>
+                <tr><td><code>restart_node</code></td><td><code>target: int</code></td><td>Brings failed node back online (2-step boot delay)</td></tr>
+                <tr><td><code>reroute_traffic</code></td><td><code>from_node: int</code>, <code>to_node: int</code></td><td>Shifts 30% of active load & queue between nodes</td></tr>
+                <tr><td><code>scale_up</code></td><td>—</td><td>Adds a temporary capacity node (TTL: 10 steps)</td></tr>
+                <tr><td><code>throttle</code></td><td><code>rate: float [0, 1]</code></td><td>Drops traffic (e.g., 0.8 accepts 80%, drops 20%)</td></tr>
+                <tr><td><code>no_op</code></td><td>—</td><td>Passive observation step</td></tr>
+            </tbody>
+        </table>
+
+        <h2>🎯 Graded Tasks</h2>
+        <h3>Task 1 — Traffic Spike Recovery (Easy)</h3>
+        <p>System receives 3× normal request rate. Keep latency below 50ms and maintain uptime. Graded on latency control and action efficiency.</p>
+        <h3>Task 2 — Single Node Failure (Medium)</h3>
+        <p>A node fails mid-episode. Agent must restart it and maintain >80% system uptime. Graded heavily on Mean Time To Repair (MTTR).</p>
+        <h3>Task 3 — Cascading Failure Prevention (Hard)</h3>
+        <p>Two connected nodes are near-critical. Agent must proactively reroute traffic <em>before</em> the failure chain triggers. Prevention is rewarded over recovery.</p>
+        <h3>Task 4 — Flash Crowd Meltdown (Expert)</h3>
+        <p>Unprecedented 5× traffic surge. Pure survival scenario requiring aggressive, simultaneous use of <code>scale_up</code> and <code>throttle</code> to prevent total cluster collapse.</p>
+    </div>
+</body>
+</html>
