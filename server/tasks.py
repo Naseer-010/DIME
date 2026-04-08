@@ -4,7 +4,7 @@ Distributed Infrastructure Management Environment.
 
 Each task provides:
     - setup(env, rng): configure initial node states and scenario parameters
-    - grade(env): return float in [0.0, 1.0] with partial credit
+    - grade(env): return float in (0.0, 1.0) with partial credit (strictly between 0 and 1)
     - is_done(env): termination condition check
     - hint: natural language task description for the agent
 """
@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 # ============================================================================
 # Task 1 — Easy: Traffic Spike Recovery
 # ============================================================================
+
 
 def _setup_traffic_spike(env: "DistributedInfraEnvironment", rng: "random.Random"):
     """System receives 3x normal request rate."""
@@ -38,7 +39,7 @@ def _grade_traffic_spike(env: "DistributedInfraEnvironment") -> float:
     """
     sim = env.sim
     if not sim.latency_history:
-        return 0.0
+        return 0.01
 
     # Latency component: fraction of steps where latency was below target
     target = 50.0  # ms
@@ -46,14 +47,16 @@ def _grade_traffic_spike(env: "DistributedInfraEnvironment") -> float:
     latency_score = below_target / len(sim.latency_history)
 
     # Uptime component: average uptime ratio
-    avg_uptime = sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 1.0
+    avg_uptime = (
+        sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 1.0
+    )
 
     # Efficiency: penalty for excessive actions
     max_reasonable = sim.max_steps * 0.5
     efficiency = max(0.0, 1.0 - sim.actions_taken / max(1, max_reasonable))
 
     score = 0.50 * latency_score + 0.30 * avg_uptime + 0.20 * efficiency
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.99, max(0.01, score)), 4)
 
 
 def _is_done_traffic_spike(env: "DistributedInfraEnvironment") -> bool:
@@ -63,6 +66,7 @@ def _is_done_traffic_spike(env: "DistributedInfraEnvironment") -> bool:
 # ============================================================================
 # Task 2 — Medium: Single Node Failure
 # ============================================================================
+
 
 def _setup_node_failure(env: "DistributedInfraEnvironment", rng: "random.Random"):
     """One node will fail at step 5. Agent must maintain 80%+ uptime."""
@@ -82,7 +86,7 @@ def _grade_node_failure(env: "DistributedInfraEnvironment") -> float:
     sim = env.sim
 
     if not sim.uptime_history:
-        return 0.0
+        return 0.01
 
     # MTTR: how quickly system recovered from the failure
     failure_duration = 0
@@ -105,7 +109,7 @@ def _grade_node_failure(env: "DistributedInfraEnvironment") -> float:
     restart_penalty = max(0.0, 1.0 - max(0, sim.restart_count - 1) / 5)
 
     score = 0.40 * mttr_score + 0.40 * uptime_score + 0.20 * restart_penalty
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.99, max(0.01, score)), 4)
 
 
 def _is_done_node_failure(env: "DistributedInfraEnvironment") -> bool:
@@ -124,6 +128,7 @@ def _is_done_node_failure(env: "DistributedInfraEnvironment") -> bool:
 # ============================================================================
 # Task 3 — Hard: Cascading Failure Prevention
 # ============================================================================
+
 
 def _setup_cascading_failure(env: "DistributedInfraEnvironment", rng: "random.Random"):
     """Two nodes near critical CPU. Agent must prevent cascade chain."""
@@ -157,10 +162,7 @@ def _grade_cascading_failure(env: "DistributedInfraEnvironment") -> float:
     cascade_score = 1.0 if not sim.cascade_occurred else 0.3
 
     if sim.uptime_history:
-        healthy_now = sum(
-            1 for n in sim.nodes
-            if not n.is_failed and n.cpu_util < 0.85
-        )
+        healthy_now = sum(1 for n in sim.nodes if not n.is_failed and n.cpu_util < 0.85)
         total_now = len(sim.nodes)
         cpu_score = healthy_now / total_now if total_now > 0 else 0.0
     else:
@@ -170,7 +172,7 @@ def _grade_cascading_failure(env: "DistributedInfraEnvironment") -> float:
     efficiency = max(0.0, 1.0 - sim.actions_taken / max(1, max_reasonable))
 
     score = 0.50 * cascade_score + 0.30 * cpu_score + 0.20 * efficiency
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.99, max(0.01, score)), 4)
 
 
 def _is_done_cascading_failure(env: "DistributedInfraEnvironment") -> bool:
@@ -185,6 +187,7 @@ def _is_done_cascading_failure(env: "DistributedInfraEnvironment") -> bool:
 # Task 4 — Expert: Flash Crowd
 # ============================================================================
 
+
 def _setup_flash_crowd(env: "DistributedInfraEnvironment", rng: "random.Random"):
     """Massive 5x traffic spike. Agent must scale up AND throttle to survive."""
     sim = env.sim
@@ -194,24 +197,30 @@ def _setup_flash_crowd(env: "DistributedInfraEnvironment", rng: "random.Random")
         node.cpu_util = 0.60 + rng.uniform(-0.05, 0.1)
         node.queue_length = rng.randint(15, 30)
 
+
 def _grade_flash_crowd(env: "DistributedInfraEnvironment") -> float:
     """
     Score = Survival Uptime (50%) + Latency control (50%).
     Cascade penalty applied if the system collapses.
     """
     sim = env.sim
-    
-    avg_uptime = sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 0.0
-    
+
+    avg_uptime = (
+        sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 0.0
+    )
+
     # Latency target is more generous for a massive flash crowd (100ms)
-    target = 100.0  
+    target = 100.0
     below_target = sum(1 for lat in sim.latency_history if lat < target)
-    latency_score = below_target / len(sim.latency_history) if sim.latency_history else 0.0
+    latency_score = (
+        below_target / len(sim.latency_history) if sim.latency_history else 0.0
+    )
 
     cascade_penalty = 0.4 if sim.cascade_occurred else 0.0
 
     score = 0.50 * avg_uptime + 0.50 * latency_score - cascade_penalty
-    return round(min(1.0, max(0.0, score)), 4)
+    return round(min(0.99, max(0.01, score)), 4)
+
 
 def _is_done_flash_crowd(env: "DistributedInfraEnvironment") -> bool:
     failed_count = sum(1 for n in env.sim.nodes if n.is_failed)

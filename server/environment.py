@@ -23,6 +23,7 @@ def _get_tasks():
     global _TASKS
     if _TASKS is None:
         from server.tasks import TASKS
+
         _TASKS = TASKS
     return _TASKS
 
@@ -41,10 +42,10 @@ class Node:
     capacity: int = 15
     is_failed: bool = False
     memory_util: float = 0.2
-    high_cpu_streak: int = 0       # consecutive steps above 90% CPU
-    restart_countdown: int = 0     # >0 means the node is restarting
-    is_temporary: bool = False     # True for scale-up nodes
-    ttl: int = 0                   # remaining lifetime for temp nodes
+    high_cpu_streak: int = 0  # consecutive steps above 90% CPU
+    restart_countdown: int = 0  # >0 means the node is restarting
+    is_temporary: bool = False  # True for scale-up nodes
+    ttl: int = 0  # remaining lifetime for temp nodes
 
 
 @dataclass
@@ -56,9 +57,9 @@ class SimulationState:
     step_count: int = 0
     base_request_rate: float = 100.0
     current_request_rate: float = 100.0
-    throttle_rate: float = 1.0      # 1.0 = accept all
+    throttle_rate: float = 1.0  # 1.0 = accept all
     latency_ms: float = 20.0
-    actions_taken: int = 0          # non-no_op actions
+    actions_taken: int = 0  # non-no_op actions
     cascade_bonus_awarded: bool = False
     task_id: str = ""
     max_steps: int = 30
@@ -73,6 +74,7 @@ class SimulationState:
 # ---------------------------------------------------------------------------
 # Default graph topology: 8 nodes in a mesh-like structure
 # ---------------------------------------------------------------------------
+
 
 def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
     """Create a default mesh-like graph of n nodes."""
@@ -175,7 +177,7 @@ class DistributedInfraEnvironment(Environment):
             episode_id=eid,
             step_count=0,
             task_id=task_id,
-            task_score=0.0,
+            task_score=0.01,
         )
 
         return self._make_observation()
@@ -224,7 +226,7 @@ class DistributedInfraEnvironment(Environment):
         # 10. Check termination
         tasks = _get_tasks()
         done = sim.step_count >= sim.max_steps
-        task_score = 0.0
+        task_score = 0.01
         if sim.task_id in tasks:
             task_info = tasks[sim.task_id]
             if task_info["is_done"](self):
@@ -293,7 +295,8 @@ class DistributedInfraEnvironment(Environment):
                     for neighbor_idx in sim.adjacency.get(src, []):
                         if (
                             not sim.nodes[neighbor_idx].is_failed
-                            and sim.nodes[neighbor_idx].cpu_util > CASCADE_AWARENESS_THRESHOLD
+                            and sim.nodes[neighbor_idx].cpu_util
+                            > CASCADE_AWARENESS_THRESHOLD
                         ):
                             sim.cascade_bonus_awarded = True
                             break
@@ -310,9 +313,7 @@ class DistributedInfraEnvironment(Environment):
             sim.nodes.append(new_node)
             # Connect to a few existing nodes
             sim.adjacency[new_idx] = []
-            connect_to = self._rng.sample(
-                range(new_idx), min(3, new_idx)
-            )
+            connect_to = self._rng.sample(range(new_idx), min(3, new_idx))
             for c in connect_to:
                 sim.adjacency[new_idx].append(c)
                 sim.adjacency[c].append(new_idx)
@@ -385,9 +386,7 @@ class DistributedInfraEnvironment(Environment):
             new_adj: Dict[int, List[int]] = {}
             for k, v in sim.adjacency.items():
                 new_k = k if k < idx else k - 1
-                new_v = [
-                    (x if x < idx else x - 1) for x in v if x != idx
-                ]
+                new_v = [(x if x < idx else x - 1) for x in v if x != idx]
                 new_adj[new_k] = new_v
             sim.adjacency = new_adj
 
@@ -411,7 +410,10 @@ class DistributedInfraEnvironment(Environment):
                 0.05,
                 min(
                     1.0,
-                    node.cpu_util + cpu_from_queue + cpu_from_processing - natural_decay
+                    node.cpu_util
+                    + cpu_from_queue
+                    + cpu_from_processing
+                    - natural_decay
                     + self._rng.uniform(-0.02, 0.02),
                 ),
             )
@@ -439,7 +441,7 @@ class DistributedInfraEnvironment(Environment):
         # Latency model: base + queue component + CPU-pressure component
         base_latency = 10.0
         queue_latency = avg_queue * 1.5
-        cpu_latency = (avg_cpu ** 2) * 80.0  # non-linear increase under load
+        cpu_latency = (avg_cpu**2) * 80.0  # non-linear increase under load
 
         new_latency = base_latency + queue_latency + cpu_latency
         # Exponential moving average
@@ -523,9 +525,7 @@ class DistributedInfraEnvironment(Environment):
         normalized_latency = min(2.0, sim.latency_ms / TARGET_LATENCY_MS)
 
         overloaded = sum(
-            1
-            for n in sim.nodes
-            if not n.is_failed and n.cpu_util > OVERLOAD_THRESHOLD
+            1 for n in sim.nodes if not n.is_failed and n.cpu_util > OVERLOAD_THRESHOLD
         )
         overload_fraction = overloaded / total
 
