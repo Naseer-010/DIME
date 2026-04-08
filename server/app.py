@@ -9,6 +9,7 @@ from openenv.core.env_server.http_server import create_app
 
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
+from fastapi.responses import HTMLResponse
 
 # --- THE FIX: The Singleton Factory Pattern ---
 # 1. Create the environment instance in memory once
@@ -25,6 +26,18 @@ app = create_app(
     InfraObservation,
     env_name="distributed_infra_env",
 )
+
+
+#Clear formatted document page for root url
+@app.get("/")
+def home():
+    # Safely locate the home.html file in the same directory as this script
+    html_file_path = os.path.join(os.path.dirname(__file__), "home.html")
+    
+    with open(html_file_path, "r", encoding="utf-8") as file:
+        html_content = file.read()
+        
+    return HTMLResponse(content=html_content)
 
 def main():
     """Entry point for direct execution."""
