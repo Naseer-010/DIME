@@ -26,7 +26,6 @@ Post-training benchmark:
 
 # UNSLOTH_VLLM_STANDBY must be set before unsloth is imported.
 import os
-
 os.environ["UNSLOTH_VLLM_STANDBY"] = "1"
 
 # ---------------------------------------------------------------------------
@@ -63,61 +62,30 @@ from trl import GRPOConfig as TRLGRPOConfig, GRPOTrainer  # noqa: E402
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 from server.command_parser import parse_command, CommandParseError
-from server.rubrics import calculate_step_reward as _calculate_step_reward
-
-
-def _probe_rubrics() -> bool:
-    """Return True if rubrics returns bounded rewards (main branch), False if -1000 (nithish)."""
-    try:
-        env = DistributedInfraEnvironment()
-        env.reset(task="traffic_spike")
-        env.sim.nodes[0].is_failed = True
-        r = _calculate_step_reward(env.sim)
-        return r > -100  # main branch returns -5.0; nithish returns -1000.0
-    except Exception:
-        return False
-
-
-_RUBRICS_BOUNDED = _probe_rubrics()
-print(
-    f"[GRPO] rubrics version: {'main (bounded [-5,+5])' if _RUBRICS_BOUNDED else 'nithish (WARNING: -1000 cliff — using fallback)'}"
-)
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-MODEL_NAME = "unsloth/Qwen3-8B"
-MAX_SEQ_LENGTH = 2048
-LORA_RANK = 32
-OUTPUT_DIR = "checkpoints/qwen3_grpo_unsloth"
+MODEL_NAME       = "unsloth/Qwen3-8B"
+MAX_SEQ_LENGTH   = 2048
+LORA_RANK        = 32
+OUTPUT_DIR       = "checkpoints/qwen3_grpo_unsloth"
 
-DATASET_EPISODES = 500  # env rollouts to build the training dataset
-MAX_STEPS = 300  # GRPOTrainer update steps
-NUM_GENERATIONS = 4  # G — completions per prompt; reward_env is CPU-bound, keep small
-MAX_COMPLETION_LENGTH = (
-    512  # Qwen3 no-think response is ~60 tokens; 512 is a safe ceiling
-)
-SAVE_STEPS = 100
+DATASET_EPISODES = 300      # env rollouts to build the training dataset
+MAX_STEPS        = 500      # GRPOTrainer update steps
+NUM_GENERATIONS  = 4        # G — completions per prompt (Unsloth: num_generations)
+SAVE_STEPS       = 100
 
 ALL_TASKS = [
-    "traffic_spike",
-    "node_failure",
-    "cascading_failure",
-    "flash_crowd",
-    "thundering_herd",
-    "zombie_node",
-    "hot_shard_skew",
-    "memory_leak_slow_burn",
-    "split_brain_io_bottleneck",
-    "black_swan_az_failure",
-    "retry_storm",
-    "connection_pool_deadlock",
-    "autoscaler_flapping_trap",
+    "traffic_spike", "node_failure", "cascading_failure", "flash_crowd",
+    "thundering_herd", "zombie_node", "hot_shard_skew", "memory_leak_slow_burn",
+    "split_brain_io_bottleneck", "black_swan_az_failure",
+    "retry_storm", "connection_pool_deadlock", "autoscaler_flapping_trap",
 ]
 
 # ---------------------------------------------------------------------------
-# System prompt — shared with inference.py
+# System prompt — identical to inference.py + rule 8 (DB recovery)
 # ---------------------------------------------------------------------------
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
@@ -140,16 +108,15 @@ Available commands:
 
 CRITICAL INCIDENT TRIAGE TREE (Follow strictly in order):
 1. OOM IMMINENT: IF ANY 'mem_utilizations' > 0.92 → kubectl delete pod node-<leaking_node>
-2. DB RECOVERY: IF node-0 is in 'failed_nodes' → kubectl delete pod node-0
-   (The DB is a SPOF. If it's dead, ALL other actions are futile until it restarts.)
-3. SPLIT-BRAIN: IF node_0 'io_wait' > 0.80 → kubectl throttle ingress --rate=0.5
-4. HOT SHARD: IF one worker CPU > 0.90 but cluster average is low
+2. SPLIT-BRAIN: IF node_0 'io_wait' > 0.80 → kubectl throttle ingress --rate=0.5
+3. HOT SHARD: IF one worker CPU > 0.90 but cluster average is low
    → kubectl exec -it istio-proxy -- traffic shift --from=<hot> --to=<cold>
-5. RETRY STORM: IF 'p99_latency' > 100.0 AND traffic spiking → kubectl throttle ingress --rate=0.4
-6. ZOMBIE NODE: IF worker CPU < 0.10 BUT 'p99_latency' is huge
+4. RETRY STORM: IF 'p99_latency' > 100.0 AND traffic spiking → kubectl throttle ingress --rate=0.4
+5. ZOMBIE NODE: IF worker CPU < 0.10 BUT 'p99_latency' is huge
    → kubectl exec -it istio-proxy -- traffic shift --from=<zombie> --to=<healthy>
-7. BLACK SWAN: IF multiple nodes in 'failed_nodes' (but DB is alive) → kubectl throttle ingress --rate=0.3
-8. DATABASE SURVIVAL: IF node-0 cpu_load > 0.80 → kubectl throttle ingress --rate=0.7
+6. BLACK SWAN: IF multiple nodes in 'failed_nodes' → kubectl throttle ingress --rate=0.3
+7. DATABASE SURVIVAL: IF node-0 cpu_load > 0.80 → kubectl throttle ingress --rate=0.7
+8. DB RECOVERY: IF node-0 is in 'failed_nodes' → kubectl delete pod node-0
 9. SAFE SCALING: IF avg worker CPU > 0.75 AND 'error_budget' > 20
    → kubectl scale deployment frontend --replicas=10
 10. HEALTHY: If metrics are stable → no_op
@@ -164,40 +131,26 @@ Respond in this exact format:
 # Triage oracle — deterministic expected action for any observation
 # ---------------------------------------------------------------------------
 
-
 def _get_expected_action(obs: dict) -> str:
-    """Return the kubectl command the triage tree mandates, or 'no_op'.
+    """Return the kubectl command the triage tree mandates, or 'no_op'."""
+    cpu   = obs.get("cpu_loads", [0.3] * 8)
+    mem   = obs.get("mem_utilizations", [0.2] * 8)
+    fail  = set(obs.get("failed_nodes", []))
+    io    = float(obs.get("io_wait", 0.0))
+    p99   = float(obs.get("p99_latency", 0.0))
+    rr    = float(obs.get("request_rate", 100.0))
+    bud   = float(obs.get("error_budget", 100.0))
 
-    Rule ordering is critical for RL convergence:
-      1. OOM — immediate life-or-death
-      2. DB Recovery — SPOF must be restored before anything else
-      3-6. Network/traffic rules
-      7. Black Swan — only fires if DB is alive
-      8-9. Proactive scaling
-      10. Healthy
-    """
-    cpu = obs.get("cpu_loads", [0.3] * 8)
-    mem = obs.get("mem_utilizations", [0.2] * 8)
-    fail = set(obs.get("failed_nodes", []))
-    io = float(obs.get("io_wait", 0.0))
-    p99 = float(obs.get("p99_latency", 0.0))
-    rr = float(obs.get("request_rate", 100.0))
-    bud = float(obs.get("error_budget", 100.0))
-
-    # Rule 1: OOM — instant kill prevention
+    # Rule 1: OOM
     for i, m in enumerate(mem):
         if float(m) > 0.92:
             return f"kubectl delete pod node-{i}"
 
-    # Rule 2: DB RECOVERY — the DB is a SPOF; if it's dead, nothing else matters
-    if 0 in fail:
-        return "kubectl delete pod node-0"
-
-    # Rule 3: Split-brain
+    # Rule 2: Split-brain
     if io > 0.80:
         return "kubectl throttle ingress --rate=0.5"
 
-    # Rule 4: Hot shard
+    # Rule 3: Hot shard
     workers = [(i, float(c)) for i, c in enumerate(cpu[1:], 1) if float(c) >= 0]
     if workers:
         avg = sum(c for _, c in workers) / len(workers)
@@ -211,11 +164,11 @@ def _get_expected_action(obs: dict) -> str:
                 if dst is not None:
                     return f"kubectl exec -it istio-proxy -- traffic shift --from={i} --to={dst}"
 
-    # Rule 5: Retry storm
+    # Rule 4: Retry storm
     if p99 > 100.0 and rr > 150:
         return "kubectl throttle ingress --rate=0.4"
 
-    # Rule 6: Zombie node
+    # Rule 5: Zombie node
     for i, c in workers:
         if 0 <= c < 0.10 and p99 > 100.0:
             dst = next(
@@ -225,14 +178,18 @@ def _get_expected_action(obs: dict) -> str:
             if dst is not None:
                 return f"kubectl exec -it istio-proxy -- traffic shift --from={i} --to={dst}"
 
-    # Rule 7: Black swan (only fires when DB is alive — DB recovery is above)
+    # Rule 6: Black swan
     if len(fail) >= 2:
         return "kubectl throttle ingress --rate=0.3"
 
-    # Rule 8: DB survival (protect a living DB under load)
+    # Rule 7: DB survival
     db_cpu = float(cpu[0]) if cpu and float(cpu[0]) >= 0 else 0.0
     if db_cpu > 0.80:
         return "kubectl throttle ingress --rate=0.7"
+
+    # Rule 8: DB recovery  ← this rule was MISSING from inference.py
+    if 0 in fail:
+        return "kubectl delete pod node-0"
 
     # Rule 9: Safe scaling
     if workers and sum(c for _, c in workers) / len(workers) > 0.75 and bud > 20:
@@ -240,27 +197,15 @@ def _get_expected_action(obs: dict) -> str:
 
     return "no_op"
 
-
 # ---------------------------------------------------------------------------
 # Dataset collection
 # ---------------------------------------------------------------------------
 
-
 def _obs_to_dict(obs: InfraObservation) -> dict:
     keys = [
-        "cpu_loads",
-        "mem_utilizations",
-        "queue_lengths",
-        "failed_nodes",
-        "latency_ms",
-        "request_rate",
-        "io_wait",
-        "p99_latency",
-        "error_budget",
-        "step",
-        "task_hint",
-        "action_errors",
-        "cloud_budget",
+        "cpu_loads", "mem_utilizations", "queue_lengths", "failed_nodes",
+        "latency_ms", "request_rate", "io_wait", "p99_latency", "error_budget",
+        "step", "task_hint", "action_errors", "cloud_budget",
     ]
     return {k: getattr(obs, k) for k in keys if hasattr(obs, k)}
 
@@ -270,14 +215,11 @@ def _heuristic_action(obs: InfraObservation) -> InfraAction:
     if random.random() < 0.30:
         atype = random.choice(["no_op", "restart_node", "throttle", "scale_up"])
         if atype == "restart_node":
-            return InfraAction(
-                action_type="restart_node",
-                target=random.randint(0, min(7, len(obs.cpu_loads) - 1)),
-            )
+            return InfraAction(action_type="restart_node",
+                               target=random.randint(0, min(7, len(obs.cpu_loads) - 1)))
         if atype == "throttle":
-            return InfraAction(
-                action_type="throttle", rate=random.choice([0.3, 0.5, 0.7])
-            )
+            return InfraAction(action_type="throttle",
+                               rate=random.choice([0.3, 0.5, 0.7]))
         if atype == "scale_up":
             return InfraAction(action_type="scale_up")
         return InfraAction(action_type="no_op")
@@ -312,23 +254,20 @@ def collect_dataset(n_episodes: int, tasks: List[str]) -> Dataset:
 
         for _ in range(20):
             d = _obs_to_dict(obs)
-            rows.append(
-                {
-                    "prompt": [
-                        {"role": "system", "content": SYSTEM_PROMPT},
-                        {
-                            "role": "user",
-                            "content": (
-                                "/no_think\n"  # suppress Qwen3 <think> block — response is ~60 tokens, not ~600
-                                f"Current system state:\n{json.dumps(d)}\n"
-                                "Respond with the required XML and JSON format."
-                            ),
-                        },
-                    ],
-                    "obs_json": json.dumps(d),
-                    "task": task,
-                }
-            )
+            rows.append({
+                "prompt": [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Current system state:\n{json.dumps(d)}\n"
+                            "Respond with the required XML and JSON format."
+                        ),
+                    },
+                ],
+                "obs_json": json.dumps(d),
+                "task": task,
+            })
 
             action = _heuristic_action(obs)
             try:
@@ -339,16 +278,14 @@ def collect_dataset(n_episodes: int, tasks: List[str]) -> Dataset:
                 break
 
         if (ep + 1) % 50 == 0:
-            print(f"  [dataset] episode {ep + 1}/{n_episodes} → {len(rows)} rows")
+            print(f"  [dataset] episode {ep+1}/{n_episodes} → {len(rows)} rows")
 
     print(f"  [dataset] collected {len(rows)} total rows")
     return Dataset.from_list(rows)
 
-
 # ---------------------------------------------------------------------------
 # Helpers shared by reward functions
 # ---------------------------------------------------------------------------
-
 
 def _get_completion_text(comp) -> str:
     """
@@ -387,7 +324,7 @@ def _restore_env_state(env: DistributedInfraEnvironment, obs: dict) -> None:
     sim = env.sim
     cpu_l = obs.get("cpu_loads", [])
     mem_l = obs.get("mem_utilizations", [])
-    q_l = obs.get("queue_lengths", [])
+    q_l   = obs.get("queue_lengths", [])
 
     for i in range(min(len(cpu_l), len(sim.nodes))):
         if float(cpu_l[i]) >= 0:
@@ -401,11 +338,10 @@ def _restore_env_state(env: DistributedInfraEnvironment, obs: dict) -> None:
         if 0 <= idx < len(sim.nodes):
             sim.nodes[idx].is_failed = True
 
-    sim.latency_ms = float(obs.get("latency_ms", 20.0))
-    sim.error_budget = float(obs.get("error_budget", 100.0))
-    sim.last_trace_p99_latency = float(obs.get("p99_latency", 0.0))
-    sim.last_trace_node_0_io = float(obs.get("io_wait", 0.0))
-
+    sim.latency_ms              = float(obs.get("latency_ms", 20.0))
+    sim.error_budget            = float(obs.get("error_budget", 100.0))
+    sim.last_trace_p99_latency  = float(obs.get("p99_latency", 0.0))
+    sim.last_trace_node_0_io    = float(obs.get("io_wait", 0.0))
 
 # ---------------------------------------------------------------------------
 # Reward functions (TRL GRPOTrainer signature)
@@ -417,7 +353,6 @@ def _restore_env_state(env: DistributedInfraEnvironment, obs: dict) -> None:
 #   len(completions) == G
 #   len(obs_json)    == G  (same value repeated G times by TRL)
 # ---------------------------------------------------------------------------
-
 
 def reward_format(completions: List, **kwargs) -> List[float]:
     """
@@ -431,18 +366,18 @@ def reward_format(completions: List, **kwargs) -> List[float]:
     scores = []
     for comp in completions:
         text = _get_completion_text(comp)
-        n_re = text.count("<reasoning>")
+        n_re  = text.count("<reasoning>")
         n_re_ = text.count("</reasoning>")
-        n_ac = text.count("<action>")
+        n_ac  = text.count("<action>")
         n_ac_ = text.count("</action>")
 
         if n_re == 1 and n_re_ == 1 and n_ac == 1 and n_ac_ == 1:
             scores.append(3.0)
         else:
             s = 0.0
-            s += 0.5 if n_re_ == 1 else -1.0
-            s += 0.5 if n_ac == 1 else -1.0
-            s += 0.5 if n_ac_ == 1 else -1.0
+            s += 0.5 if n_re_  == 1 else -1.0
+            s += 0.5 if n_ac   == 1 else -1.0
+            s += 0.5 if n_ac_  == 1 else -1.0
             scores.append(s)
     return scores
 
@@ -479,25 +414,25 @@ def reward_env(
     **kwargs,
 ) -> List[float]:
     """
-    Environment simulation reward — the PRIMARY training signal.
+    Environment simulation reward — the core signal that replaces -1000.
 
-    Uses calculate_step_reward() from server/rubrics.py:
-      - 7 components: uptime, DB CPU, memory cliff, p99 latency, load shedding,
-        action efficiency, temporal friction
-      - Bounded to [-5.0, +5.0] — no -1000 cliff, gradients always flow
+    For each completion:
+      1. Reconstruct env state from obs_json (approximate but sufficient)
+      2. Execute the parsed action
+      3. Measure three components:
+           uptime  = +0.5 × alive_fraction
+           latency = −0.5 × clamp((lat−50)/100)²
+           db_fail = −2.0 if node-0 is failed
 
-    Output is scaled by 2× so the environment physics dominates over the
-    oracle (reward_triage) in the total reward signal.
-
-    Range: [−10.0, +10.0]  (2× the raw [-5, +5])
+    Range: [−2.5, +0.5]
     """
     scores = []
     for i, comp in enumerate(completions):
         try:
-            obs_data = json.loads(obs_json[i]) if obs_json else {}
+            obs_data  = json.loads(obs_json[i]) if obs_json else {}
             task_name = task[i] if task else "traffic_spike"
         except (TypeError, IndexError, json.JSONDecodeError):
-            scores.append(-10.0)
+            scores.append(-2.5)
             continue
 
         env = DistributedInfraEnvironment()
@@ -518,18 +453,13 @@ def reward_env(
         except Exception:
             pass
 
-        if _RUBRICS_BOUNDED:
-            # Main branch: 2× scaled to dominate over oracle reward
-            scores.append(2.0 * _calculate_step_reward(env.sim))
-        else:
-            # Nithish branch fallback: simple 3-component formula [-5.0, +1.0]
-            sim = env.sim
-            nodes = sim.nodes
-            alive = sum(1 for n in nodes if not n.is_failed)
-            r_up = 0.5 * (alive / max(len(nodes), 1))
-            r_lat = -0.5 * min((max(0.0, sim.latency_ms - 50.0) / 100.0) ** 2, 1.0)
-            r_db = -2.0 if (nodes and nodes[0].is_failed) else 0.0
-            scores.append(2.0 * (r_up + r_lat + r_db))
+        sim   = env.sim
+        nodes = sim.nodes
+        alive = sum(1 for n in nodes if not n.is_failed)
+        r_up  = 0.5 * (alive / max(len(nodes), 1))
+        r_lat = -0.5 * min((max(0.0, sim.latency_ms - 50.0) / 100.0) ** 2, 1.0)
+        r_db  = -2.0 if (nodes and nodes[0].is_failed) else 0.0
+        scores.append(r_up + r_lat + r_db)
 
     return scores
 
@@ -540,119 +470,103 @@ def reward_triage(
     **kwargs,
 ) -> List[float]:
     """
-    Triage oracle reward — gentle guidance, NOT the primary teacher.
+    Triage oracle reward (mirrors Unsloth's check_answer / check_numbers pattern).
 
     Compares the model's action against the deterministic triage tree output.
-    Kept intentionally weak so reward_env (physics) dominates learning.
 
-    +1.0 — exact command match with expected action
-    +0.5 — same action_type but different parameters
-     0.0 — no_op when a specific action is expected, or healthy system
-    -0.5 — completely wrong action type
-    -0.5 — unnecessary action when system is healthy (expected no_op)
+    +5.0 — exact command match with expected action
+    +2.0 — same action_type but different parameters (e.g., throttle at wrong rate)
+     0.0 — no_op when a specific action is expected
+    -2.0 — completely wrong action type
+    -1.0 — unnecessary action when system is healthy (expected no_op)
+
+    This reward is intentionally strong to bootstrap correct rule-following.
     """
     scores = []
     for i, comp in enumerate(completions):
         try:
             obs_data = json.loads(obs_json[i]) if obs_json else {}
         except (TypeError, IndexError, json.JSONDecodeError):
-            scores.append(-0.5)
+            scores.append(-2.0)
             continue
 
-        expected = _get_expected_action(obs_data)
+        expected  = _get_expected_action(obs_data)
         predicted = _extract_command(_get_completion_text(comp))
 
         if predicted is None:
-            scores.append(-0.5)
+            scores.append(-2.0)
             continue
 
         if predicted.strip() == expected.strip():
-            scores.append(1.0)
+            scores.append(5.0)
             continue
 
         if expected == "no_op":
-            # Healthy system — mild penalty for unnecessary intervention
-            scores.append(-0.5 if predicted != "no_op" else 0.0)
+            # Healthy system — penalise unnecessary intervention
+            scores.append(-1.0 if predicted != "no_op" else 0.0)
             continue
 
         if predicted == "no_op":
-            # Missed a required action — mild penalty
-            scores.append(0.0)
+            # Missed a required action
+            scores.append(-2.0)
             continue
 
         # Same action type, wrong parameters?
         try:
             act_p = parse_command(predicted)
             act_e = parse_command(expected)
-            scores.append(0.5 if act_p.action_type == act_e.action_type else -0.5)
+            scores.append(2.0 if act_p.action_type == act_e.action_type else -2.0)
         except CommandParseError:
-            scores.append(-0.5)
+            scores.append(-2.0)
 
     return scores
-
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
-
 def main() -> None:
     # ---- Load model (Unsloth FastLanguageModel + LoRA + FP8) ----
     print(f"[GRPO] Loading {MODEL_NAME} ...")
-    # fast_inference=True  → vLLM engine, much faster generation (~3-5x vs model.generate)
-    # compilation_config=0 → basic CUDA graphs only; skips piecewise graph-split that
-    #                        crashes on A100 SM 8.0 (vLLM bug in _decompose_size_nodes)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=MODEL_NAME,
-        max_seq_length=MAX_SEQ_LENGTH,
-        load_in_4bit=False,
-        fast_inference=True,
-        max_lora_rank=LORA_RANK,
-        load_in_fp8=False,  # FP8 requires compute capability 8.9+; A100 is 8.0
-        compilation_config=0,  # avoid piecewise graph-split crash; still uses CUDA graphs
+        model_name       = MODEL_NAME,
+        max_seq_length   = MAX_SEQ_LENGTH,
+        load_in_4bit     = False,        # LoRA 16-bit
+        fast_inference   = True,         # Enable vLLM
+        max_lora_rank    = LORA_RANK,
+        load_in_fp8      = True,         # FP8 GRPO — halves optimizer memory
     )
 
     model = FastLanguageModel.get_peft_model(
         model,
-        r=LORA_RANK,
-        lora_alpha=LORA_RANK * 2,  # 2× alpha speeds up training
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",  # include MLP for DIME reasoning
+        r                     = LORA_RANK,
+        lora_alpha            = LORA_RANK * 2,   # 2× alpha speeds up training
+        target_modules        = [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",  # include MLP for DIME reasoning
         ],
-        use_gradient_checkpointing="unsloth",  # 30% memory reduction
-        random_state=3407,
+        use_gradient_checkpointing = "unsloth",  # 30% memory reduction
+        random_state          = 3407,
     )
 
     # ---- Collect dataset ----
-    print(
-        f"\n[GRPO] Collecting dataset ({DATASET_EPISODES} episodes, {len(ALL_TASKS)} tasks)..."
-    )
+    print(f"\n[GRPO] Collecting dataset ({DATASET_EPISODES} episodes, {len(ALL_TASKS)} tasks)...")
     dataset = collect_dataset(DATASET_EPISODES, ALL_TASKS)
 
     # Filter prompts that exceed 90th-percentile token length (avoids outlier OOM)
     print("[GRPO] Filtering dataset by prompt length...")
     prompt_lens = [
-        len(
-            tokenizer.apply_chat_template(
-                row["prompt"], add_generation_prompt=True, tokenize=True
-            )
-        )
+        len(tokenizer.apply_chat_template(
+            row["prompt"], add_generation_prompt=True, tokenize=True
+        ))
         for row in dataset
     ]
-    max_prompt_len = int(np.quantile(prompt_lens, 0.90)) + 1
-    max_comp_len = MAX_SEQ_LENGTH - max_prompt_len
-    keep_idx = [i for i, L in enumerate(prompt_lens) if L <= max_prompt_len]
-    dataset = dataset.select(keep_idx)
-    print(
-        f"[GRPO] Final dataset: {len(dataset)} rows | "
-        f"max_prompt={max_prompt_len} max_completion={max_comp_len}"
-    )
+    max_prompt_len  = int(np.quantile(prompt_lens, 0.90)) + 1
+    max_comp_len    = MAX_SEQ_LENGTH - max_prompt_len
+    keep_idx        = [i for i, L in enumerate(prompt_lens) if L <= max_prompt_len]
+    dataset         = dataset.select(keep_idx)
+    print(f"[GRPO] Final dataset: {len(dataset)} rows | "
+          f"max_prompt={max_prompt_len} max_completion={max_comp_len}")
 
     # ---- Sleep vLLM engine if available (frees VRAM during training) ----
     if hasattr(model, "vllm_engine") and model.vllm_engine is not None:
@@ -666,40 +580,39 @@ def main() -> None:
     # PatchFastRL above also re-adds vllm_sampling_params as an alias, but the
     # native params are clearer and forward-compatible.
     training_args = TRLGRPOConfig(
-        temperature=1.0,
-        top_k=50,
-        top_p=0.95,
-        min_p=0.1,
-        learning_rate=5e-6,
-        weight_decay=0.01,
-        warmup_ratio=0.1,
-        lr_scheduler_type="cosine",
-        optim="adamw_8bit",
-        logging_steps=5,
-        per_device_train_batch_size=1,  # keep small: reward_env is CPU-bound, not GPU-bound
-        gradient_accumulation_steps=4,  # effective batch = 4
-        num_generations=NUM_GENERATIONS,
-        vllm_gpu_memory_utilization=0.7,  # 70% of remaining VRAM for KV cache → faster generation
-        max_prompt_length=max_prompt_len,
-        max_completion_length=MAX_COMPLETION_LENGTH,  # hard cap: prevents Qwen3 think-block bloat
-        max_steps=MAX_STEPS,
-        save_steps=SAVE_STEPS,
-        output_dir=OUTPUT_DIR,
-        report_to="none",
+        temperature                  = 1.0,
+        top_k                        = 50,
+        top_p                        = 0.95,
+        min_p                        = 0.1,
+        learning_rate                = 5e-6,
+        weight_decay                 = 0.01,
+        warmup_ratio                 = 0.1,
+        lr_scheduler_type            = "cosine",
+        optim                        = "adamw_8bit",
+        logging_steps                = 5,
+        per_device_train_batch_size  = 1,
+        gradient_accumulation_steps  = 4,     # effective batch = 4
+        num_generations              = NUM_GENERATIONS,
+        max_prompt_length            = max_prompt_len,
+        max_completion_length        = max_comp_len,
+        max_steps                    = MAX_STEPS,
+        save_steps                   = SAVE_STEPS,
+        output_dir                   = OUTPUT_DIR,
+        report_to                    = "none",
     )
 
     # ---- Trainer ----
     trainer = GRPOTrainer(
-        model=model,
-        processing_class=tokenizer,
-        reward_funcs=[
-            reward_format,  # structural: <reasoning><action> tags          ← early signal
+        model            = model,
+        processing_class = tokenizer,
+        reward_funcs     = [
+            reward_format,    # structural: <reasoning><action> tags          ← early signal
             reward_validity,  # syntactic: command parses without error        ← anti-hallucination
-            reward_env,  # semantic: env simulation, uptime+latency       ← main SRE signal
-            reward_triage,  # oracle: matches triage tree expected action    ← strong supervision
+            reward_env,       # semantic: env simulation, uptime+latency       ← main SRE signal
+            reward_triage,    # oracle: matches triage tree expected action    ← strong supervision
         ],
-        args=training_args,
-        train_dataset=dataset,
+        args             = training_args,
+        train_dataset    = dataset,
     )
 
     print("\n[GRPO] Training starts...")
