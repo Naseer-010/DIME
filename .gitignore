@@ -16,3 +16,5 @@ logs/
 OpenEnv/
 distributed_infra_env/
 pre_validate.sh
+test_venv/
+venv/

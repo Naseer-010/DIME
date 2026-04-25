@@ -329,8 +329,6 @@ class DistributedInfraEnvironment(Environment):
 
         return obs
 
-        return obs
-
     @property
     def state(self) -> InfraState:
         return self._state
