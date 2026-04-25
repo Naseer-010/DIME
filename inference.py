@@ -5,6 +5,8 @@ LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
 Evaluates the autonomous reasoning capabilities of LLMs for SRE tasks.
 Features robust CoT reasoning extraction, exponential backoff retries,
 CSV metric logging, and a strict action reconstructor to guarantee 0 crashes.
+
+Supports both local inference (Hugging Face Transformers) and endpoint inference (OpenAI Client).
 """
 
 import json
@@ -24,12 +26,16 @@ from typing import List, Optional, Dict, Tuple
 from dotenv import load_dotenv
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
+from openai import OpenAI
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
+# Select inference mode: "local" or "endpoint"
+INFERENCE_MODE = os.environ.get("INFERENCE_MODE", "endpoint").lower()
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 API_KEY = (
@@ -64,8 +70,10 @@ TASKS = [
 MAX_RETRIES = 4
 BENCHMARK = "distributed_infra_env"
 
+# Global states for models and clients
 tokenizer = None
 model = None
+client: Optional[OpenAI] = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
@@ -201,7 +209,10 @@ def tee_output(log_path: Path):
 
 
 def log_start(task: str, env: str, model: str) -> None:
-    print(f"\n[START] task={task} env={env} model={model}", flush=True)
+    print(
+        f"\n[START] task={task} env={env} model={model} mode={INFERENCE_MODE.upper()}",
+        flush=True,
+    )
 
 
 def log_step(
@@ -228,24 +239,35 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # ---------------------------------------------------------------------------
 
 
-# def get_client() -> OpenAI:
-#     global client
-#     if not API_KEY:
-#         raise ValueError("API_KEY environment variable is missing!")
-#     if client is None:
-#         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-#     return client
+def get_client() -> OpenAI:
+    """Initialize the OpenAI client for endpoint inference."""
+    global client
+    if not API_KEY:
+        raise ValueError(
+            "API_KEY environment variable is missing for endpoint inference!"
+        )
+    if client is None:
+        print(
+            f"\n[INFO] Connecting to endpoint {API_BASE_URL} for model {MODEL_NAME}...",
+            flush=True,
+        )
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    return client
+
 
 def load_local_model():
+    """Load local models via Hugging Face Transformers to GPU."""
     global tokenizer, model
     if model is None:
-        print(f"\n[INFO] Loading local model {MODEL_NAME} via Transformers to GPU...", flush=True)
+        print(
+            f"\n[INFO] Loading local model {MODEL_NAME} via Transformers to GPU...",
+            flush=True,
+        )
         tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
         model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME,
-            torch_dtype=torch.bfloat16,
-            device_map="auto"
+            MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto"
         )
+
 
 def parse_llm_response(text: str) -> Tuple[dict, str]:
     """Robustly extracts JSON action and reasoning, handling markdown and loose formatting."""
@@ -281,8 +303,6 @@ def parse_llm_response(text: str) -> Tuple[dict, str]:
         json_text = json_text[start_idx : end_idx + 1]
     else:
         json_text = '{"command": "no_op"}'
-        print("[DEBUG] RAW TEXT:", text)
-        raise ValueError("Model output unparsable")
 
     # Clean up markdown code blocks if the LLM added them
     json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
@@ -294,21 +314,18 @@ def parse_llm_response(text: str) -> Tuple[dict, str]:
         try:
             action_dict = ast.literal_eval(json_text)
         except Exception as e:
-            print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
             action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
     except Exception as e:
-        print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
+        action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
 
     return action_dict, reasoning
+
 
 def build_safe_backend_action(action_dict: dict) -> dict:
     """
     STRICT RECONSTRUCTOR: Prevents FastAPI 422 Errors.
     Guarantees the backend only receives valid keys specified in server/models.py.
-    Prioritizes 'raw_command' syntax to allow the backend's regex parser to do the heavy lifting.
     """
-    # 1. If the LLM successfully formatted the new prompt, it output a "command" key.
-    # We must translate this to "raw_command" for the backend parser and satisfy Pydantic.
     if isinstance(action_dict, dict) and (
         "command" in action_dict or "raw_command" in action_dict
     ):
@@ -317,8 +334,6 @@ def build_safe_backend_action(action_dict: dict) -> dict:
         ).strip()
         return {"action_type": "no_op", "raw_command": cmd}
 
-    # 2. Fallback: If the LLM hallucinates an old schema (e.g., outputs {"action_type": "throttle", "rate": 0.5})
-    # We map it safely.
     safe_action = {"action_type": action_dict.get("action_type", "no_op")}
     act_type = safe_action["action_type"]
 
@@ -347,12 +362,10 @@ def build_safe_backend_action(action_dict: dict) -> dict:
 
     return safe_action
 
+
 def llm_decide(observation: dict) -> Tuple[dict, str]:
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
-
-    # Load the model (the function ensures it only loads once)
-    load_local_model()
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -361,54 +374,87 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
 
     for attempt in range(MAX_RETRIES):
         try:
-            # Apply the official Llama-3 chat template
-            prompt = tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-                enable_thinking=True
-            )
-            
-            # Move inputs to the GPU
-            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+            content = ""
 
-            # Generate (using greedy decoding since temperature was ~0.01)
-            with torch.no_grad():
-                outputs = model.generate(
-                    **inputs,
-                    max_new_tokens=4096,
-                    do_sample=True,
+            # --- LOCAL GPU INFERENCE ---
+            if INFERENCE_MODE == "local":
+                load_local_model()
+
+                try:
+                    prompt = tokenizer.apply_chat_template(
+                        messages,
+                        tokenize=False,
+                        add_generation_prompt=True,
+                        enable_thinking=True,
+                    )
+                except TypeError:
+                    # Fallback if tokenizer doesn't support enable_thinking arg
+                    prompt = tokenizer.apply_chat_template(
+                        messages, tokenize=False, add_generation_prompt=True
+                    )
+
+                inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=4096,
+                        do_sample=True,
+                        temperature=0.7,
+                        top_p=0.9,
+                        pad_token_id=tokenizer.eos_token_id,
+                    )
+
+                input_length = inputs.input_ids.shape[1]
+                content = tokenizer.decode(
+                    outputs[0][input_length:], skip_special_tokens=True
+                ).strip()
+
+            # --- REMOTE ENDPOINT INFERENCE ---
+            elif INFERENCE_MODE == "endpoint":
+                api_client = get_client()
+                response = api_client.chat.completions.create(
+                    model=MODEL_NAME,
+                    messages=messages,
+                    max_tokens=4000,
                     temperature=0.7,
                     top_p=0.9,
-                    pad_token_id=tokenizer.eos_token_id
+                )
+                content = response.choices[0].message.content.strip()
+
+            else:
+                raise ValueError(
+                    f"Unknown INFERENCE_MODE: {INFERENCE_MODE}. Must be 'local' or 'endpoint'."
                 )
 
-            # Extract ONLY the newly generated text (ignoring the input prompt)
-            input_length = inputs.input_ids.shape[1]
-            content = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True).strip()
-            
             action_dict, reasoning = parse_llm_response(content)
 
             print("\n[DEBUG RAW OUTPUT]\n", content, "\n", flush=True)
 
-            if "action_type" in action_dict or "command" in action_dict or "raw_command" in action_dict:
+            if (
+                "action_type" in action_dict
+                or "command" in action_dict
+                or "raw_command" in action_dict
+            ):
                 return action_dict, reasoning
 
         except Exception as e:
-            # Exponential Backoff (2s, 4s, 8s, 16s)
+            # Exponential Backoff for API rate limits
             wait_time = 2 ** (attempt + 1)
             print(
                 f"[WARNING] Inference call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
                 flush=True,
             )
-            print(f"[DEBUG] Retrying in {wait_time} seconds...", flush=True)
-            time.sleep(wait_time)
+            if INFERENCE_MODE == "endpoint":
+                print(f"[DEBUG] Retrying in {wait_time} seconds...", flush=True)
+                time.sleep(wait_time)
 
     print("[ERROR] Inference repeatedly failed. Skipping turn with no_op.", flush=True)
     return {
         "action_type": "no_op",
         "kubectl_command": "no_op",
     }, "Inference Error - Fallback to no_op"
+
 
 def env_reset(task_id: str) -> dict:
     for attempt in range(MAX_RETRIES):
@@ -543,13 +589,14 @@ def run_task(task_id: str) -> dict:
 
 
 def main():
-    print(f"API KEY LOADED:", API_KEY[:10] if API_KEY else "Missing!")
+    print(f"API KEY LOADED:", API_KEY[:10] if API_KEY else "Missing or Running Local!")
 
     all_task_stats = []
 
     with tee_output(LOG_FILE):
         print(f"==================================================")
         print(f"  STARTING DIME EVALUATION SESSION: {MODEL_NAME}")
+        print(f"  MODE: {INFERENCE_MODE.upper()}")
         print(f"==================================================")
 
         for task_id in TASKS:
