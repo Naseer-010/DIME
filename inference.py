@@ -2,8 +2,10 @@
 """
 LLM Agent Inference Loop for Distributed Infrastructure Environment.
 
-Runs the LLM agent against all 3 graded tasks and reports scores.
+Runs the LLM agent against all graded tasks and reports scores.
 Strictly adheres to the Meta-PyTorch OpenEnv Hackathon STDOUT format.
+
+Updated to use kubectl/AWS CLI command syntax (real-world action schemas).
 """
 
 import json
@@ -33,30 +35,41 @@ BENCHMARK = "distributed_infra_env"
 
 client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE).
-You receive observations about the system state as JSON and must respond with a single action as JSON.
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
+You receive observations about the system state as JSON and must respond with a SINGLE kubectl command.
 
-Available actions:
-- {"action_type": "restart_node", "target": <int>}
-- {"action_type": "reroute_traffic", "from_node": <int>, "to_node": <int>}
-- {"action_type": "scale_up"}
-- {"action_type": "throttle", "rate": <float>}
-- {"action_type": "no_op"}
+Available commands:
+- kubectl delete pod node-<ID>           → restart a failed node
+- kubectl scale deployment frontend --replicas=<N>  → scale up capacity
+- kubectl exec -it istio-proxy -- traffic shift --from=<ID> --to=<ID>  → reroute traffic
+- kubectl throttle ingress --rate=<float>  → throttle incoming requests (0.0-1.0)
+- kubectl logs node-<ID>                 → investigate a node with telemetry timeout
+- no_op                                  → do nothing
+
+IMPORTANT: Some nodes may show telemetry "timeout" (cpu_load = -1). Use "kubectl logs node-<ID>" to investigate before acting on those nodes.
+
+IMPORTANT: You have a limited cloud budget. Each scale-up costs 1 unit. Check cloud_budget in the observation before scaling.
+
+IMPORTANT: Restart has a 5-step cooldown per node. If you see a CooldownActive error, wait before retrying.
 
 CRITICAL DECISION TREE (Follow strictly):
-1. IF 'failed_nodes' is not empty: 
-   IMMEDIATELY output {"action_type": "restart_node", "target": <failed_node_index>}
-2. IF any node in 'cpu_loads' is > 0.85:
-   Find the node with highest CPU and lowest CPU. 
-   Output {"action_type": "reroute_traffic", "from_node": <high>, "to_node": <low>}
-3. IF average 'cpu_loads' > 0.70 AND no nodes are failing:
-   Output {"action_type": "scale_up"}
-4. IF 'latency_ms' > 45.0:
-   Output {"action_type": "throttle", "rate": 0.8}
-5. IF none of the above are true:
-   Output {"action_type": "no_op"}
+1. IF 'action_errors' is not empty:
+   READ the errors and adapt your strategy accordingly.
+2. IF any node has telemetry "timeout" (cpu_load == -1):
+   Output: kubectl logs node-<ID>
+3. IF 'failed_nodes' is not empty:
+   IMMEDIATELY output: kubectl delete pod node-<failed_node_index>
+4. IF any node's cpu_load > 0.85:
+   Find the node with highest CPU and lowest CPU.
+   Output: kubectl exec -it istio-proxy -- traffic shift --from=<high> --to=<low>
+5. IF average cpu_loads > 0.70 AND cloud_budget > 0:
+   Output: kubectl scale deployment frontend --replicas=10
+6. IF 'latency_ms' > 45.0:
+   Output: kubectl throttle ingress --rate=0.8
+7. IF none of the above are true:
+   Output: no_op
 
-Respond with ONLY a valid JSON action object. No markdown formatting, and no other text."""
+Respond with ONLY the kubectl command or "no_op". No markdown, no explanation."""
 
 # ---------------------------------------------------------------------------
 # Required Logging Functions
@@ -93,9 +106,7 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 def llm_decide(observation: dict) -> dict:
     obs_str = json.dumps(observation)
-    user_prompt = (
-        f"Current system state:\n{obs_str}\nRespond with ONLY a JSON action object."
-    )
+    user_prompt = f"Current system state:\n{obs_str}\nRespond with ONLY a kubectl command or 'no_op'."
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -109,13 +120,21 @@ def llm_decide(observation: dict) -> dict:
                 temperature=0.01,
             )
             content = response.choices[0].message.content.strip()
-            if "```json" in content:
-                content = content.split("```json")[1].split("```")[0].strip()
-            elif "```" in content:
+            # Strip any markdown code fences
+            if "```" in content:
                 content = content.split("```")[1].split("```")[0].strip()
+
+            # If the LLM returned a raw kubectl command, wrap it
+            if content.startswith("kubectl") or content.startswith("aws"):
+                return {"raw_command": content}
+
+            # If it returned "no_op", handle that
+            if "no_op" in content.lower() or "noop" in content.lower():
+                return {"action_type": "no_op"}
+
+            # Try parsing as JSON (backward compatibility)
             return json.loads(content)
         except Exception as e:
-            # FIX: Print the actual error so it shows up in logs!
             print(
                 f"[DEBUG] LLM call attempt {attempt + 1} failed: {str(e)}", flush=True
             )
@@ -173,7 +192,6 @@ def run_task(task_id: str) -> float:
         done = False
 
         try:
-            # ---> THE CHANGES YOU ASKED ABOUT ARE HERE <---
             result = env_step(action)
             data_block = result.get("data", result)
 
@@ -199,9 +217,7 @@ def run_task(task_id: str) -> float:
             step=step, action=action_str, reward=reward, done=done, error=error_msg
         )
 
-        # Even if step > 100 hits (timeout failure), task_score has the partial credit from the last step!
         if done or step > 100:
-            # Define success: Let's say getting more than 0.1 points counts as partial success
             success = task_score >= 0.1
             log_end(success=success, steps=step, score=task_score, rewards=rewards_list)
             return task_score

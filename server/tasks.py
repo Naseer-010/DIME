@@ -1,12 +1,19 @@
 """
-Three graded tasks with increasing difficulty for the
+Graded tasks with curriculum-based difficulty levels for the
 Distributed Infrastructure Management Environment.
 
 Each task provides:
     - setup(env, rng): configure initial node states and scenario parameters
-    - grade(env): return float in (0.0, 1.0) with partial credit (strictly between 0 and 1)
+    - grade(env): return float in (0.0, 1.0) with partial credit
     - is_done(env): termination condition check
     - hint: natural language task description for the agent
+
+Curriculum Levels
+-----------------
+Level 1  Warm Start     — Identify the failing node from logs (high success rate)
+Level 2  Single Fix     — One node fails, agent must restart it
+Level 3  Stochastic     — Gaussian traffic spikes, multi-step interventions
+Level 4  Expert         — Brutal cascading failures with tight budgets
 """
 
 from __future__ import annotations
@@ -18,7 +25,47 @@ if TYPE_CHECKING:
 
 
 # ============================================================================
-# Task 1 — Easy: Traffic Spike Recovery
+# Level 1 — Warm Start: Read Logs & Identify Failing Node
+# ============================================================================
+
+
+def _setup_level_1(env: "DistributedInfraEnvironment", rng: "random.Random"):
+    """One node is pre-failed. Agent just needs to identify it via query_logs."""
+    sim = env.sim
+    sim.max_steps = 15
+    sim.current_request_rate = sim.base_request_rate * 1.0  # normal traffic
+    # Fail one random node
+    fail_idx = rng.randint(0, len(sim.nodes) - 1)
+    sim.nodes[fail_idx].is_failed = True
+    sim.nodes[fail_idx].cpu_util = 0.0
+    sim.nodes[fail_idx].queue_length = 0
+
+
+def _grade_level_1(env: "DistributedInfraEnvironment") -> float:
+    """
+    Score = 0.7 * identified failing node (restarted it) + 0.3 * speed.
+    """
+    sim = env.sim
+    # Did the agent restart the failed node?
+    all_alive = all(not n.is_failed for n in sim.nodes)
+    identification = 1.0 if all_alive else 0.2
+
+    # Speed bonus: faster = better
+    speed = max(0.0, 1.0 - sim.step_count / sim.max_steps)
+
+    score = 0.70 * identification + 0.30 * speed
+    return round(min(0.99, max(0.01, score)), 4)
+
+
+def _is_done_level_1(env: "DistributedInfraEnvironment") -> bool:
+    sim = env.sim
+    # Done if agent fixed the node or time ran out
+    all_alive = all(not n.is_failed and n.restart_countdown == 0 for n in sim.nodes)
+    return all_alive or sim.step_count >= sim.max_steps
+
+
+# ============================================================================
+# Level 2 / Task 1 — Traffic Spike Recovery
 # ============================================================================
 
 
@@ -64,7 +111,7 @@ def _is_done_traffic_spike(env: "DistributedInfraEnvironment") -> bool:
 
 
 # ============================================================================
-# Task 2 — Medium: Single Node Failure
+# Level 2 / Task 2 — Single Node Failure
 # ============================================================================
 
 
@@ -126,7 +173,16 @@ def _is_done_node_failure(env: "DistributedInfraEnvironment") -> bool:
 
 
 # ============================================================================
-# Task 3 — Hard: Cascading Failure Prevention
+# Level 2 — Alias: Single Fix (same as node_failure)
+# ============================================================================
+
+_setup_level_2 = _setup_node_failure
+_grade_level_2 = _grade_node_failure
+_is_done_level_2 = _is_done_node_failure
+
+
+# ============================================================================
+# Level 3 / Task 3 — Cascading Failure Prevention (Stochastic)
 # ============================================================================
 
 
@@ -184,7 +240,25 @@ def _is_done_cascading_failure(env: "DistributedInfraEnvironment") -> bool:
 
 
 # ============================================================================
-# Task 4 — Expert: Flash Crowd
+# Level 3 — Alias: Stochastic (enhanced version of cascading_failure)
+# ============================================================================
+
+
+def _setup_level_3(env: "DistributedInfraEnvironment", rng: "random.Random"):
+    """Gaussian stochastic traffic spikes with noisy sensors."""
+    _setup_cascading_failure(env, rng)
+    sim = env.sim
+    # Add Gaussian noise to request rate each step (handled in sim dynamics)
+    sim.current_request_rate = sim.base_request_rate * (2.0 + rng.gauss(0, 0.5))
+    sim.max_steps = 45
+
+
+_grade_level_3 = _grade_cascading_failure
+_is_done_level_3 = _is_done_cascading_failure
+
+
+# ============================================================================
+# Level 4 / Task 4 — Expert: Flash Crowd
 # ============================================================================
 
 
@@ -231,10 +305,64 @@ def _is_done_flash_crowd(env: "DistributedInfraEnvironment") -> bool:
 
 
 # ============================================================================
+# Level 4 — Alias: Expert (flash crowd with tightest constraints)
+# ============================================================================
+
+_setup_level_4 = _setup_flash_crowd
+_grade_level_4 = _grade_flash_crowd
+_is_done_level_4 = _is_done_flash_crowd
+
+
+# ============================================================================
 # Task Registry
 # ============================================================================
 
 TASKS = {
+    # --- Curriculum levels ---
+    "level_1_read_logs": {
+        "setup": _setup_level_1,
+        "grade": _grade_level_1,
+        "is_done": _is_done_level_1,
+        "hint": (
+            "WARM START (Level 1): One node in your cluster has silently failed. "
+            "Use 'query_logs' to investigate nodes with telemetry dropouts and "
+            "identify the failing node. Then restart it. "
+            "This is a diagnostic exercise — focus on observation before action."
+        ),
+    },
+    "level_2_single_fix": {
+        "setup": _setup_level_2,
+        "grade": _grade_level_2,
+        "is_done": _is_done_level_2,
+        "hint": (
+            "SINGLE FIX (Level 2): A node failure will occur during this episode. "
+            "Detect the failure, restart the affected node, and maintain uptime "
+            "above 80%%. Minimise unnecessary restarts."
+        ),
+    },
+    "level_3_stochastic": {
+        "setup": _setup_level_3,
+        "grade": _grade_level_3,
+        "is_done": _is_done_level_3,
+        "hint": (
+            "STOCHASTIC SPIKES (Level 3): Traffic follows a noisy Gaussian pattern. "
+            "Multiple nodes are near critical CPU. Proactively reroute traffic and "
+            "scale up before cascading failures occur. Telemetry may be spotty — "
+            "use query_logs to investigate timeouts."
+        ),
+    },
+    "level_4_expert": {
+        "setup": _setup_level_4,
+        "grade": _grade_level_4,
+        "is_done": _is_done_level_4,
+        "hint": (
+            "EXPERT MODE (Level 4): A brutal 5x flash crowd with tight cloud budget. "
+            "You MUST aggressively scale up AND throttle to survive. Budget is limited — "
+            "every scale_up costs 1 unit. If you exhaust your budget, you cannot add "
+            "more capacity. Plan wisely."
+        ),
+    },
+    # --- Original task aliases (backward-compatible) ---
     "traffic_spike": {
         "setup": _setup_traffic_spike,
         "grade": _grade_traffic_spike,
