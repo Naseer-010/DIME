@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """
-LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
+LLM Agent Inference Loop for Distributed Infrastructure Environment.
 
-Runs the LLM agent against all graded tasks and reports model-specific
-performance summaries to structured log files. Strictly adheres to the
-Meta-PyTorch OpenEnv Hackathon STDOUT format.
+Combines CoT (Chain-of-Thought) reasoning, crash-prevention (422 bypass),
+CSV metric logging for plotting, and a structured SRE DIME Index summary.
 """
 
 import json
@@ -13,20 +12,34 @@ import sys
 import time
 import traceback
 import math
+import csv
 from contextlib import contextmanager
 from pathlib import Path
 import requests
-from typing import List, Optional, Dict
+from typing import List, Optional
+
+from dotenv import load_dotenv
 from openai import OpenAI
+
+load_dotenv()
 
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
+API_KEY = (
+    os.environ.get("API_KEY")
+    or os.environ.get("OPENAI_API_KEY")
+    or os.environ.get("HF_TOKEN")
+)
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:7860")
+ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
+
+# Dynamic logging paths
+safe_model_name = MODEL_NAME.replace("/", "_").replace(".", "_")
+LOG_FILE = Path(__file__).resolve().parent / f"logs_{safe_model_name}.txt"
+METRICS_FILE = Path(__file__).resolve().parent / f"metrics_{safe_model_name}.csv"
 
 TASKS = [
     "traffic_spike",
@@ -41,7 +54,7 @@ BENCHMARK = "distributed_infra_env"
 client: Optional[OpenAI] = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
-You receive observations about the system state as JSON and must respond with a SINGLE kubectl command.
+You receive observations about the system state as JSON and must respond with a command.
 
 CLUSTER ARCHITECTURE:
 - Node 0 (worker-0) is the DATABASE — all request processing requires a DB query.
@@ -61,44 +74,66 @@ CONSTRAINTS:
 - Cloud budget is LIMITED. Check cloud_budget before scaling.
 - Restart has a 5-step cooldown per node.
 - NEVER set throttle rate below 0.3 — dropping >70% of traffic causes a massive throughput penalty.
-- Observations include 'prometheus_metrics' in production scrape format.
 
 CRITICAL DECISION TREE (Follow strictly):
-1. IF 'action_errors' contains "CRITICAL: Database node failed":
-   IMMEDIATELY output: kubectl delete pod node-0
-2. IF any node has telemetry "timeout" (cpu_load == -1):
-   Output: kubectl logs node-<ID>
-3. IF 'failed_nodes' is not empty:
-   IMMEDIATELY output: kubectl delete pod node-<failed_node_index>
-4. IF node-0 (DB) cpu_load > 0.75:
-   RELIEVE DB PRESSURE: kubectl throttle ingress --rate=0.7
-   (Do NOT reroute traffic away from DB — all servers depend on it)
-5. IF any app server cpu_load > 0.85:
-   Find the node with highest CPU and lowest CPU among app servers.
-   Output: kubectl exec -it istio-proxy -- traffic shift --from=<high> --to=<low>
-6. IF average cpu_loads > 0.70 AND cloud_budget > 0:
-   Output: kubectl scale deployment frontend --replicas=10
-7. IF 'latency_ms' > 45.0:
-   Output: kubectl throttle ingress --rate=0.8
-8. IF none of the above are true:
-   Output: no_op
+1. IF 'action_errors' contains "CRITICAL: Database node failed": IMMEDIATELY output: kubectl delete pod node-0
+2. IF any node has telemetry "timeout" (cpu_load == -1): Output: kubectl logs node-<ID>
+3. IF 'failed_nodes' is not empty: IMMEDIATELY output: kubectl delete pod node-<failed_node_index>
+4. IF node-0 (DB) cpu_load > 0.75: RELIEVE DB PRESSURE: kubectl throttle ingress --rate=0.7
+5. IF any app server cpu_load > 0.85: Find the node with highest CPU and lowest CPU among app servers. Output: kubectl exec -it istio-proxy -- traffic shift --from=<high> --to=<low>
+6. IF average cpu_loads > 0.70 AND cloud_budget > 0: Output: kubectl scale deployment frontend --replicas=10
+7. IF 'latency_ms' > 45.0: Output: kubectl throttle ingress --rate=0.8
+8. IF none of the above are true: Output: no_op
 
-Respond with ONLY the kubectl command or "no_op". No markdown, no explanation."""
+Respond using the following STRICT format. You must include the XML reasoning tags:
+<reasoning>Briefly explain your diagnostic thought process here.</reasoning>
+<action>
+{"command": "your_kubectl_command_or_no_op_here"}
+</action>"""
+
 
 # ---------------------------------------------------------------------------
-# Required Logging Functions
+# CSV Logging Setup for Graphs
 # ---------------------------------------------------------------------------
+def init_metrics_file():
+    if not METRICS_FILE.exists():
+        with open(METRICS_FILE, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "model",
+                    "task_id",
+                    "step",
+                    "action_taken",
+                    "reward",
+                    "cumulative_score",
+                    "done",
+                    "error",
+                ]
+            )
 
 
-def get_log_path(model_name: str) -> Path:
-    """Generate a dynamic, safe log file name based on the model being tested."""
-    safe_name = model_name.replace("/", "_").replace(".", "_")
-    return Path(__file__).resolve().parent / f"logs_{safe_name}.txt"
+init_metrics_file()
 
 
+def log_to_csv(
+    task_id: str,
+    step: int,
+    action: str,
+    reward: float,
+    score: float,
+    done: bool,
+    error: str,
+):
+    with open(METRICS_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([MODEL_NAME, task_id, step, action, reward, score, done, error])
+
+
+# ---------------------------------------------------------------------------
+# Terminal Logging Functions
+# ---------------------------------------------------------------------------
 class TeeStream:
-    """Write stream output to the terminal and a log file."""
-
     def __init__(self, primary, log_file) -> None:
         self.primary = primary
         self.log_file = log_file
@@ -164,7 +199,7 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 def get_client() -> OpenAI:
     global client
     if not API_KEY:
-        raise ValueError("API_KEY or HF_TOKEN environment variable is missing!")
+        raise ValueError("API_KEY environment variable is missing!")
     if client is None:
         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
     return client
@@ -172,7 +207,7 @@ def get_client() -> OpenAI:
 
 def llm_decide(observation: dict) -> dict:
     obs_str = json.dumps(observation)
-    user_prompt = f"Current system state:\n{obs_str}\nRespond with ONLY a kubectl command or 'no_op'."
+    user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
 
     for attempt in range(MAX_RETRIES):
         try:
@@ -182,31 +217,20 @@ def llm_decide(observation: dict) -> dict:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=150,
+                max_tokens=350,
                 temperature=0.01,
             )
             content = response.choices[0].message.content.strip()
-            # Strip any markdown code fences
-            if "```" in content:
-                content = content.split("```")[1].split("```")[0].strip()
 
-            # If the LLM returned a raw kubectl command, wrap it
-            if content.startswith("kubectl") or content.startswith("aws"):
-                return {"raw_command": content}
+            # THE 422 BYPASS: Send raw string. backend command_parser extracts the XML.
+            return {"action_type": "no_op", "raw_command": content}
 
-            # If it returned "no_op", handle that
-            if "no_op" in content.lower() or "noop" in content.lower():
-                return {"action_type": "no_op"}
-
-            # Try parsing as JSON (backward compatibility)
-            return json.loads(content)
         except Exception as e:
             print(
                 f"[DEBUG] LLM call attempt {attempt + 1} failed: {str(e)}", flush=True
             )
             time.sleep(1)
 
-    # If it fails all retries, return a no_op
     return {"action_type": "no_op"}
 
 
@@ -230,12 +254,16 @@ def env_step(action: dict) -> dict:
     return response.json()
 
 
-def run_task(task_id: str, model_name: str) -> dict:
-    log_start(task=task_id, env=BENCHMARK, model=model_name)
+def run_task(task_id: str) -> dict:
+    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
 
     try:
         obs = env_reset(task_id)
     except Exception as e:
+        print(
+            f"[FATAL ERROR] Failed to connect to environment server for task '{task_id}': {e}",
+            flush=True,
+        )
         log_end(success=False, steps=0, score=0.0, rewards=[])
         return {
             "task": task_id,
@@ -254,7 +282,7 @@ def run_task(task_id: str, model_name: str) -> dict:
     while True:
         step += 1
 
-        # Track metrics if present in the observation
+        # Track metrics
         lat = float(obs.get("latency_ms", 0.0))
         up = float(obs.get("uptime_pct", 0.0))
         if lat > 0:
@@ -263,8 +291,6 @@ def run_task(task_id: str, model_name: str) -> dict:
             uptimes.append(up)
 
         action = llm_decide(obs)
-
-        # Format action strictly on one line without quotes that break bash/parsing
         action_str = json.dumps(action).replace('"', "'")
 
         error_msg = None
@@ -284,18 +310,19 @@ def run_task(task_id: str, model_name: str) -> dict:
 
             reward = float(data_block.get("reward", obs.get("reward", 0.0)))
             done = bool(data_block.get("done", obs.get("done", False)))
-
-            # Continuously update task_score
             task_score = float(obs.get("task_score", 0.0))
 
         except Exception as e:
-            error_msg = str(e).replace("\n", " ")  # Prevent newline breaks in STDOUT
+            error_msg = str(e).replace("\n", " ")
             done = True
 
         rewards_list.append(reward)
+
+        # Write to outputs
         log_step(
             step=step, action=action_str, reward=reward, done=done, error=error_msg
         )
+        log_to_csv(task_id, step, action_str, reward, task_score, done, error_msg)
 
         if done or step > 100:
             success = task_score >= 0.1
@@ -314,16 +341,17 @@ def run_task(task_id: str, model_name: str) -> dict:
 
 
 def main():
-    log_path = get_log_path(MODEL_NAME)
+    print(f"API KEY LOADED:", API_KEY[:10] if API_KEY else "Missing!")
+
     all_task_stats = []
 
-    with tee_output(log_path):
+    with tee_output(LOG_FILE):
         print(f"==================================================")
         print(f"  STARTING DIME EVALUATION SESSION: {MODEL_NAME}")
         print(f"==================================================")
 
         for task_id in TASKS:
-            stats = run_task(task_id, MODEL_NAME)
+            stats = run_task(task_id)
             all_task_stats.append(stats)
 
         # -----------------------------------------------------------
@@ -342,16 +370,13 @@ def main():
                 f"{s['task']:<25} | {s['score']:<12.4f} | {s['avg_uptime']:<12.1f} | {s['avg_latency']:<15.1f}"
             )
 
-        # Calculate Overarching Performance Metric (DIME Index)
-        # Using a weighted calculation: (Avg Task Score * Avg Uptime) / log(Safe Latency)
+        # Calculate DIME Index
         overall_score = sum(s["score"] for s in all_task_stats) / max(
             len(all_task_stats), 1
         )
         avg_system_uptime = sum(s["avg_uptime"] for s in all_task_stats) / max(
             len(all_task_stats), 1
         )
-
-        # Ensure latency > 1 to avoid ZeroDivisionError or negative logs
         avg_system_latency = sum(s["avg_latency"] for s in all_task_stats) / max(
             len(all_task_stats), 1
         )
@@ -366,6 +391,8 @@ def main():
         print("=" * 80)
         print(f"OVERALL DIME INDEX (Higher=Better): {dime_index:.4f}")
         print("=" * 80)
+        print(f"Logs saved to: {LOG_FILE}")
+        print(f"Metrics saved to: {METRICS_FILE}")
 
 
 if __name__ == "__main__":
