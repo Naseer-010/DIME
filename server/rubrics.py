@@ -14,11 +14,12 @@ or extended independently.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Protocol
 
 if TYPE_CHECKING:
-    from server.environment import SimulationState
+    from server.environment import Node, SimulationState
 
 
 # ---------------------------------------------------------------------------
@@ -44,17 +45,18 @@ class Verifier(Protocol):
 @dataclass
 class FormatVerifier:
     """
-    +0.1 for outputting a syntactically correct, valid action.
+    +1.0 for outputting a syntactically correct response/action format.
 
-    The environment sets ``sim.last_action_valid`` before reward computation.
-    A malformed or unparseable action gets 0.
+    ``last_response_format_valid`` is set by the environment. For structured
+    actions this means valid JSON reached the server; for raw commands it means
+    the parser found the required <reasoning> XML block and JSON command body.
     """
 
     name: str = "format"
-    weight: float = 0.1
+    weight: float = 1.0
 
     def score(self, sim: "SimulationState") -> float:
-        return self.weight if sim.last_action_valid else 0.0
+        return self.weight if sim.last_response_format_valid else 0.0
 
 
 @dataclass
@@ -76,42 +78,86 @@ class StabilityVerifier:
 
 
 @dataclass
-class SLAVerifier:
+class SafeSliceLatencyVerifier:
     """
-    +0.3 for keeping P99 latency under Target (default 50 ms).
+    Smooth bounded sigmoid latency penalty.
 
-    Uses the rolling-average ``sim.latency_ms`` as a proxy for P99.
+    Keeps the SLA threshold informative without the zero-gradient cliff from a
+    binary pass/fail reward.
     """
 
-    name: str = "sla"
-    weight: float = 0.3
-    target_ms: float = 50.0
+    name: str = "latency"
+    alpha: float = 0.001
+    beta: float = 0.3
+    gamma: float = 0.1
+    tau: float = 50.0
 
     def score(self, sim: "SimulationState") -> float:
-        return self.weight if sim.latency_ms < self.target_ms else 0.0
+        lat = sim.latency_ms
+        x = max(-60.0, min(60.0, self.gamma * (lat - self.tau)))
+        sigmoid = 1.0 / (1.0 + math.exp(-x))
+        return -(self.alpha * lat) - (self.beta * sigmoid)
 
 
 @dataclass
-class EfficiencyVerifier:
+class CascadePBRSVerifier:
     """
-    -0.2 penalty if the agent calls ``scale_up`` while the average
-    cluster CPU utilisation is below 60 %.
+    Potential-Based Reward Shaping for cluster stress.
 
-    Proves the environment trains cost-aware models, not just stable ones.
+    Rewards reduction in overload stress between consecutive states while
+    preserving the optimal policy under Ng et al.'s PBRS formulation.
+    """
+
+    name: str = "cascade_pbrs"
+    beta_stress: float = 1.0
+    tau_stress: float = 0.85
+    gamma: float = 0.99
+
+    def _phi(self, nodes: List["Node"]) -> float:
+        stress = sum(
+            max(0.0, n.cpu_util - self.tau_stress) ** 2
+            for n in nodes
+            if not n.is_failed
+        )
+        return -self.beta_stress * stress
+
+    def score(self, sim: "SimulationState") -> float:
+        if not sim.previous_nodes:
+            return 0.0
+        phi_current = self._phi(sim.nodes)
+        phi_prev = self._phi(sim.previous_nodes)
+        return (self.gamma * phi_current) - phi_prev
+
+
+@dataclass
+class EconomicEfficiencyVerifier:
+    """
+    Linear active-node cost plus L1 churn penalty.
+
+    Penalizes cloud footprint every step and discourages flapping capacity up
+    and down across consecutive transitions.
     """
 
     name: str = "efficiency"
-    penalty: float = -0.2
-    cpu_threshold: float = 0.60
+    w_cost: float = 0.1
+    w_churn: float = 0.2
+    n_max: float = 20.0
 
     def score(self, sim: "SimulationState") -> float:
-        if sim.last_action_type != "scale_up":
-            return 0.0
-        operational = [n for n in sim.nodes if not n.is_failed]
-        if not operational:
-            return 0.0
-        avg_cpu = sum(n.cpu_util for n in operational) / len(operational)
-        return self.penalty if avg_cpu < self.cpu_threshold else 0.0
+        n_active = sum(1 for n in sim.nodes if not n.is_failed)
+        prev_active = sim.previous_active_nodes
+        if prev_active is None:
+            prev_active = n_active
+
+        delta_n = abs(n_active - prev_active)
+        cost_penalty = self.w_cost * (n_active / self.n_max)
+        churn_penalty = self.w_churn * (delta_n / self.n_max)
+        return -(cost_penalty + churn_penalty)
+
+
+# Backward-compatible import names for code that referenced the old verifiers.
+SLAVerifier = SafeSliceLatencyVerifier
+EfficiencyVerifier = EconomicEfficiencyVerifier
 
 
 @dataclass
@@ -141,8 +187,9 @@ class ThroughputVerifier:
 DEFAULT_RUBRICS: List[Verifier] = [
     FormatVerifier(),
     StabilityVerifier(),
-    SLAVerifier(),
-    EfficiencyVerifier(),
+    SafeSliceLatencyVerifier(),
+    CascadePBRSVerifier(),
+    EconomicEfficiencyVerifier(),
     ThroughputVerifier(),
 ]
 

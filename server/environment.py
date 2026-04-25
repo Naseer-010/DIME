@@ -8,6 +8,7 @@ anti-hacking budgets/cooldowns, and real-world action schemas.
 """
 
 import random
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -16,7 +17,11 @@ from openenv.core.env_server.interfaces import Environment
 
 from server.models import InfraAction, InfraObservation, InfraState
 from server.rubrics import compute_composite_reward
-from server.command_parser import parse_command, CommandParseError
+from server.command_parser import (
+    CommandParseError,
+    has_reasoning_json_format,
+    parse_command,
+)
 
 # Import tasks lazily to avoid circular imports
 _TASKS = None
@@ -77,7 +82,10 @@ class SimulationState:
 
     # --- Composable rubric support ---
     last_action_valid: bool = True
+    last_response_format_valid: bool = True
     last_action_type: str = "no_op"
+    previous_nodes: List[Node] = field(default_factory=list)
+    previous_active_nodes: Optional[int] = None
 
     # --- Curriculum ---
     curriculum_level: int = 1
@@ -259,6 +267,8 @@ class DistributedInfraEnvironment(Environment):
 
         # 0. Reset per-step error list
         sim.action_errors = []
+        sim.previous_nodes = deepcopy(sim.nodes)
+        sim.previous_active_nodes = sum(1 for n in sim.nodes if not n.is_failed)
 
         # 1. Process agent action (handles raw_command, budgets, cooldowns)
         self._apply_action(action)
@@ -322,16 +332,21 @@ class DistributedInfraEnvironment(Environment):
 
         # --- Raw command parsing (real-world kubectl/AWS CLI) ---
         if action.raw_command:
+            sim.last_response_format_valid = False
             try:
+                raw_has_cot_format = has_reasoning_json_format(action.raw_command)
                 action = parse_command(action.raw_command)
                 sim.last_action_valid = True
+                sim.last_response_format_valid = raw_has_cot_format
             except CommandParseError as exc:
                 sim.action_errors.append(f"ParseError: {exc}")
                 sim.last_action_valid = False
+                sim.last_response_format_valid = False
                 sim.last_action_type = "parse_error"
                 return
         else:
             sim.last_action_valid = True
+            sim.last_response_format_valid = True
 
         sim.last_action_type = action.action_type
 
@@ -696,10 +711,12 @@ class DistributedInfraEnvironment(Environment):
         Dense step-level reward using independent, composable verifiers.
 
         Each verifier scores one aspect:
-          - FormatVerifier:     +0.1  for a valid action
-          - StabilityVerifier:  +0.4  for 100% uptime
-          - SLAVerifier:        +0.3  for P99 latency < 50ms
-          - EfficiencyVerifier: -0.2  penalty for wasteful scale_up
+          - FormatVerifier:              +1.0 for valid response format
+          - StabilityVerifier:           +0.4 for 100% uptime
+          - SafeSliceLatencyVerifier:    smooth bounded latency penalty
+          - CascadePBRSVerifier:         potential-based stress delta
+          - EconomicEfficiencyVerifier:  linear cost + L1 churn penalty
+          - ThroughputVerifier:          zero-service exploit penalty
 
         The breakdown is stored in ``_last_rubric_breakdown`` for
         inclusion in the observation metadata.
