@@ -60,6 +60,7 @@ TASK_LABELS = {
     "level_2_single_fix": "Level 2: Single Fix",
     "level_3_stochastic": "Level 3: Stochastic",
     "level_4_expert": "Level 4: Expert",
+    "level_5_alibaba_trace": "Level 5: Alibaba Trace",
 }
 
 BASE_IDS = ("CTRL", "GW-A", "GW-B", "CMP-1", "CMP-2", "CMP-3", "DB-A", "DB-B")

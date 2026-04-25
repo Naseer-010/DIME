@@ -126,6 +126,15 @@ class InfraObservation(Observation):
         description="Remaining cloud budget units for scale_up.",
     )
 
+    # --- Prometheus-style telemetry ---
+    prometheus_metrics: List[Dict] = Field(
+        default_factory=list,
+        description=(
+            "Prometheus-style structured metrics. Each entry is a dict with "
+            "'metric', 'labels', 'value', 'timestamp' keys."
+        ),
+    )
+
 
 class InfraState(State):
     """

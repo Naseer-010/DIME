@@ -29,7 +29,13 @@ MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:7860")
 
-TASKS = ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]
+TASKS = [
+    "traffic_spike",
+    "node_failure",
+    "cascading_failure",
+    "flash_crowd",
+    "level_5_alibaba_trace",
+]
 MAX_RETRIES = 3
 BENCHMARK = "distributed_infra_env"
 
@@ -38,35 +44,44 @@ client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
 You receive observations about the system state as JSON and must respond with a SINGLE kubectl command.
 
+CLUSTER ARCHITECTURE:
+- Node 0 (worker-0) is the DATABASE — all request processing requires a DB query.
+  If the DB is overloaded or fails, ALL app servers stop processing.
+- Nodes 1-7 (worker-1 through worker-7) are APP SERVERS — they receive external traffic.
+- New nodes from scale_up have a 3-STEP COLD START (10% processing speed during boot).
+
 Available commands:
 - kubectl delete pod node-<ID>           → restart a failed node
-- kubectl scale deployment frontend --replicas=<N>  → scale up capacity
+- kubectl scale deployment frontend --replicas=<N>  → scale up capacity (costs 1 budget unit, 3-step cold start)
 - kubectl exec -it istio-proxy -- traffic shift --from=<ID> --to=<ID>  → reroute traffic
 - kubectl throttle ingress --rate=<float>  → throttle incoming requests (0.0-1.0)
 - kubectl logs node-<ID>                 → investigate a node with telemetry timeout
 - no_op                                  → do nothing
 
-IMPORTANT: Some nodes may show telemetry "timeout" (cpu_load = -1). Use "kubectl logs node-<ID>" to investigate before acting on those nodes.
-
-IMPORTANT: You have a limited cloud budget. Each scale-up costs 1 unit. Check cloud_budget in the observation before scaling.
-
-IMPORTANT: Restart has a 5-step cooldown per node. If you see a CooldownActive error, wait before retrying.
+CONSTRAINTS:
+- Cloud budget is LIMITED. Check cloud_budget before scaling.
+- Restart has a 5-step cooldown per node.
+- NEVER set throttle rate below 0.3 — dropping >70% of traffic causes a massive throughput penalty.
+- Observations include 'prometheus_metrics' in production scrape format.
 
 CRITICAL DECISION TREE (Follow strictly):
-1. IF 'action_errors' is not empty:
-   READ the errors and adapt your strategy accordingly.
+1. IF 'action_errors' contains "CRITICAL: Database node failed":
+   IMMEDIATELY output: kubectl delete pod node-0
 2. IF any node has telemetry "timeout" (cpu_load == -1):
    Output: kubectl logs node-<ID>
 3. IF 'failed_nodes' is not empty:
    IMMEDIATELY output: kubectl delete pod node-<failed_node_index>
-4. IF any node's cpu_load > 0.85:
-   Find the node with highest CPU and lowest CPU.
+4. IF node-0 (DB) cpu_load > 0.75:
+   RELIEVE DB PRESSURE: kubectl throttle ingress --rate=0.7
+   (Do NOT reroute traffic away from DB — all servers depend on it)
+5. IF any app server cpu_load > 0.85:
+   Find the node with highest CPU and lowest CPU among app servers.
    Output: kubectl exec -it istio-proxy -- traffic shift --from=<high> --to=<low>
-5. IF average cpu_loads > 0.70 AND cloud_budget > 0:
+6. IF average cpu_loads > 0.70 AND cloud_budget > 0:
    Output: kubectl scale deployment frontend --replicas=10
-6. IF 'latency_ms' > 45.0:
+7. IF 'latency_ms' > 45.0:
    Output: kubectl throttle ingress --rate=0.8
-7. IF none of the above are true:
+8. IF none of the above are true:
    Output: no_op
 
 Respond with ONLY the kubectl command or "no_op". No markdown, no explanation."""

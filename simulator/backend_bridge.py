@@ -15,6 +15,7 @@ TASK_IDS = (
     "level_2_single_fix",
     "level_3_stochastic",
     "level_4_expert",
+    "level_5_alibaba_trace",
 )
 
 

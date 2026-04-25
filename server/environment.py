@@ -49,6 +49,8 @@ class Node:
     restart_countdown: int = 0  # >0 means the node is restarting
     is_temporary: bool = False  # True for scale-up nodes
     ttl: int = 0  # remaining lifetime for temp nodes
+    role: str = "app_server"  # "database" or "app_server"
+    booting_steps: int = 0  # >0 means cold start, reduced processing speed
 
 
 @dataclass
@@ -89,6 +91,13 @@ class SimulationState:
     # --- Partial observability ---
     telemetry_dropout_nodes: List[int] = field(default_factory=list)
 
+    # --- Trace replay ---
+    trace_replay: Any = None  # Optional[TraceReplay]
+
+    # --- Throughput tracking (anti-exploit) ---
+    total_requests_received: int = 0
+    total_requests_served: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Default graph topology: 8 nodes in a mesh-like structure
@@ -96,20 +105,41 @@ class SimulationState:
 
 
 def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
-    """Create a default mesh-like graph of n nodes."""
-    nodes = [Node(cpu_util=0.25 + random.uniform(-0.05, 0.05)) for _ in range(n)]
-
-    # Build connected graph: ring + some cross-links for redundancy
-    adjacency: Dict[int, List[int]] = {i: [] for i in range(n)}
+    """Create a default graph with node roles: node 0 = Database, rest = App Servers."""
+    nodes = []
     for i in range(n):
-        # Ring connections
-        right = (i + 1) % n
+        if i == 0:
+            # Database node: higher capacity, single point of failure
+            nodes.append(
+                Node(
+                    cpu_util=0.20 + random.uniform(-0.03, 0.03),
+                    capacity=25,
+                    role="database",
+                )
+            )
+        else:
+            nodes.append(
+                Node(
+                    cpu_util=0.25 + random.uniform(-0.05, 0.05),
+                    capacity=15,
+                    role="app_server",
+                )
+            )
+
+    # Build connected graph: ring + cross-links, DB connected to all app servers
+    adjacency: Dict[int, List[int]] = {i: [] for i in range(n)}
+    # DB (node 0) connects to every app server
+    for i in range(1, n):
+        adjacency[0].append(i)
+        adjacency[i].append(0)
+    # App servers: ring + skip connections among themselves
+    for i in range(1, n):
+        right = 1 + (i % (n - 1))  # wrap within app server range
         if right not in adjacency[i]:
             adjacency[i].append(right)
             adjacency[right].append(i)
-        # Skip-one connection for mesh density
-        skip = (i + 2) % n
-        if skip not in adjacency[i]:
+        skip = 1 + ((i + 1) % (n - 1))
+        if skip not in adjacency[i] and skip != right:
             adjacency[i].append(skip)
             adjacency[skip].append(i)
 
@@ -384,13 +414,15 @@ class DistributedInfraEnvironment(Environment):
                 return
             sim.cloud_budget -= 1
 
-            # Add temporary capacity node
+            # Add temporary capacity node with cold start
             new_idx = len(sim.nodes)
             new_node = Node(
                 cpu_util=0.1,
                 queue_length=0,
                 is_temporary=True,
                 ttl=10,
+                role="app_server",
+                booting_steps=3,  # cold start: 3 steps at 10% speed
             )
             sim.nodes.append(new_node)
             # Connect to a few existing nodes
@@ -407,20 +439,37 @@ class DistributedInfraEnvironment(Environment):
     # ----- Simulation dynamics -----
 
     def _simulate_requests(self) -> None:
-        """Simulate incoming request arrivals using Poisson process."""
+        """Simulate incoming request arrivals (trace replay or Gaussian)."""
         sim = self._sim
-        # Variable-rate Poisson with burst potential
+
+        # --- Trace replay: override request rate from real data ---
+        if sim.trace_replay is not None:
+            trace_step = sim.trace_replay.get_step(sim.step_count)
+            sim.current_request_rate = trace_step.request_rate
+            # Inject per-node CPU baselines from trace
+            for node_idx, cpu_val in trace_step.node_cpu.items():
+                if node_idx < len(sim.nodes) and not sim.nodes[node_idx].is_failed:
+                    # Blend trace CPU with simulation dynamics (60% trace, 40% sim)
+                    sim.nodes[node_idx].cpu_util = (
+                        0.6 * cpu_val + 0.4 * sim.nodes[node_idx].cpu_util
+                    )
+            # Add trace latency injection
+            sim.latency_ms += trace_step.latency_injection * 0.3
+
+        # Variable-rate with burst potential
         effective_rate = sim.current_request_rate * sim.throttle_rate
 
-        # Poisson arrival count for this step
+        # Arrival count for this step
         arrival_count = self._rng.gauss(effective_rate, effective_rate * 0.15)
         arrival_count = max(0, int(arrival_count))
+        sim.total_requests_received += arrival_count
 
-        # Distribute arrivals across operational nodes
+        # Distribute arrivals across operational APP SERVER nodes only
+        # (DB receives back-pressure from app servers, not direct traffic)
         operational = [
             i
             for i, n in enumerate(sim.nodes)
-            if not n.is_failed and n.restart_countdown == 0
+            if not n.is_failed and n.restart_countdown == 0 and n.role == "app_server"
         ]
         if not operational:
             return
@@ -486,15 +535,49 @@ class DistributedInfraEnvironment(Environment):
             sim.adjacency = new_adj
 
     def _distribute_load(self) -> None:
-        """Process queued requests → affect CPU utilization."""
+        """Process queued requests → affect CPU utilization (with cold start + DB dependency)."""
         sim = self._sim
+
+        # Find the DB node for dependency calculations
+        db_node = None
+        for i, n in enumerate(sim.nodes):
+            if n.role == "database" and not n.is_failed:
+                db_node = n
+                db_idx = i
+                break
+
+        db_available = db_node is not None and db_node.restart_countdown == 0
+
         for i, node in enumerate(sim.nodes):
             if node.is_failed or node.restart_countdown > 0:
                 continue
 
+            # --- Cold start: booting nodes process at 10% speed ---
+            effective_capacity = node.capacity
+            if node.booting_steps > 0:
+                effective_capacity = max(1, int(node.capacity * 0.10))
+                node.booting_steps -= 1
+
+            # --- DB dependency: app servers can't process if DB is down ---
+            if node.role == "app_server" and not db_available:
+                # App servers can't process requests without the DB
+                effective_capacity = 0
+
             # Process some requests from queue
-            processed = min(node.queue_length, node.capacity)
+            processed = min(node.queue_length, effective_capacity)
             node.queue_length = max(0, node.queue_length - processed)
+            sim.total_requests_served += processed
+
+            # --- DB back-pressure: each app server request costs DB CPU ---
+            if (
+                node.role == "app_server"
+                and db_node is not None
+                and db_available
+                and processed > 0
+            ):
+                db_load = processed * 0.006  # each request costs DB ~0.6% CPU
+                db_node.cpu_util = min(1.0, db_node.cpu_util + db_load)
+                db_node.queue_length += max(1, processed // 5)
 
             # CPU effect: each processed request adds load, with natural decay
             cpu_from_queue = node.queue_length * 0.008
@@ -543,7 +626,10 @@ class DistributedInfraEnvironment(Environment):
         sim.latency_ms = sim.latency_ms * 0.3 + new_latency * 0.7
 
     def _check_failures(self) -> None:
-        """Check if nodes fail due to sustained high CPU, trigger cascades."""
+        """Check if nodes fail due to sustained high CPU, trigger cascades.
+
+        DB failure is catastrophic: all app servers lose processing ability.
+        """
         sim = self._sim
         newly_failed: List[int] = []
 
@@ -572,6 +658,12 @@ class DistributedInfraEnvironment(Environment):
             sim.cascade_occurred = True
             for idx in newly_failed:
                 self._redistribute_from_node(idx)
+                # If DB fails, log a critical dependency event
+                if sim.nodes[idx].role == "database":
+                    sim.action_errors.append(
+                        "CRITICAL: Database node failed — all app server "
+                        "processing halted until DB is restarted."
+                    )
 
     def _redistribute_from_node(self, idx: int) -> None:
         """Redistribute a failed/removed node's load to its neighbors."""
@@ -624,7 +716,7 @@ class DistributedInfraEnvironment(Environment):
     # ----- Observation builder -----
 
     def _make_observation(self) -> InfraObservation:
-        """Build the current observation for the agent (with partial observability)."""
+        """Build the current observation with partial observability + Prometheus metrics."""
         sim = self._sim
         tasks = _get_tasks()
 
@@ -641,21 +733,90 @@ class DistributedInfraEnvironment(Environment):
         new_dropouts: List[int] = []
         for i, node in enumerate(sim.nodes):
             if i in sim.telemetry_dropout_nodes:
-                # Still dropped out
                 new_dropouts.append(i)
             elif self._rng.random() < 0.05:
                 new_dropouts.append(i)
         sim.telemetry_dropout_nodes = new_dropouts
 
+        # --- Build Prometheus-style metrics ---
+        prometheus_metrics: List[Dict[str, Any]] = []
+        ts = sim.step_count * 30  # simulate 30s intervals
+
         for i, node in enumerate(sim.nodes):
-            if i in sim.telemetry_dropout_nodes:
-                cpu_loads.append(-1.0)  # sentinel: data unavailable
+            node_name = f"worker-{i}"
+            is_dropped = i in sim.telemetry_dropout_nodes
+
+            if is_dropped:
+                cpu_loads.append(-1.0)
                 queue_lengths.append(-1)
                 telemetry_status[i] = "timeout"
+                prometheus_metrics.append(
+                    {
+                        "metric": "node_scrape_error",
+                        "labels": {"node": node_name, "role": node.role},
+                        "value": 1,
+                        "timestamp": ts,
+                    }
+                )
             else:
                 cpu_loads.append(round(node.cpu_util, 3))
                 queue_lengths.append(node.queue_length)
                 telemetry_status[i] = "ok"
+                prometheus_metrics.extend(
+                    [
+                        {
+                            "metric": "node_cpu_utilization",
+                            "labels": {"node": node_name, "role": node.role},
+                            "value": round(node.cpu_util, 4),
+                            "timestamp": ts,
+                        },
+                        {
+                            "metric": "node_memory_utilization",
+                            "labels": {"node": node_name, "role": node.role},
+                            "value": round(node.memory_util, 4),
+                            "timestamp": ts,
+                        },
+                        {
+                            "metric": "node_queue_depth",
+                            "labels": {"node": node_name, "role": node.role},
+                            "value": node.queue_length,
+                            "timestamp": ts,
+                        },
+                    ]
+                )
+                if node.booting_steps > 0:
+                    prometheus_metrics.append(
+                        {
+                            "metric": "node_boot_remaining_steps",
+                            "labels": {"node": node_name},
+                            "value": node.booting_steps,
+                            "timestamp": ts,
+                        }
+                    )
+
+        # Global metrics
+        prometheus_metrics.extend(
+            [
+                {
+                    "metric": "cluster_latency_ms",
+                    "labels": {},
+                    "value": round(sim.latency_ms, 2),
+                    "timestamp": ts,
+                },
+                {
+                    "metric": "cluster_request_rate",
+                    "labels": {},
+                    "value": round(sim.current_request_rate * sim.throttle_rate, 2),
+                    "timestamp": ts,
+                },
+                {
+                    "metric": "cluster_cloud_budget",
+                    "labels": {},
+                    "value": sim.cloud_budget,
+                    "timestamp": ts,
+                },
+            ]
+        )
 
         return InfraObservation(
             cpu_loads=cpu_loads,
@@ -670,4 +831,5 @@ class DistributedInfraEnvironment(Environment):
             telemetry_status=telemetry_status,
             action_errors=list(sim.action_errors),
             cloud_budget=sim.cloud_budget,
+            prometheus_metrics=prometheus_metrics,
         )
