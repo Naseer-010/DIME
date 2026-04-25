@@ -3,55 +3,48 @@
 LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
 
 Evaluates the autonomous reasoning capabilities of LLMs for SRE tasks.
-Features robust CoT reasoning extraction, exponential backoff retries,
-CSV metric logging, and a strict action reconstructor to guarantee 0 crashes.
+Features:
+  - Dual-mode inference: local GPU (Transformers) and remote endpoint (OpenAI API)
+  - Structured JSON-lines logging per episode + legacy console/CSV output
+  - Robust CoT reasoning extraction with multi-format fallback
+  - Strict action reconstructor to guarantee 0 backend crashes
+  - CLI argument support for model, mode, tasks, log directory
 
-Supports both local inference (Hugging Face Transformers) and endpoint inference (OpenAI Client).
+Usage:
+  python inference.py                                    # defaults
+  python inference.py --mode local --model Qwen/Qwen3-8B
+  python inference.py --mode endpoint --tasks traffic_spike node_failure
+  python inference.py --log-dir /path/to/logs
 """
 
+import argparse
+import ast
+import csv
 import json
+import math
 import os
+import re
 import sys
 import time
 import traceback
-import math
-import csv
-import re
-import ast
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
-import requests
-from typing import List, Optional, Dict, Tuple
+from typing import List, Optional, Tuple
 
+import requests
 from dotenv import load_dotenv
-import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from openai import OpenAI
 
 load_dotenv()
 
 # ---------------------------------------------------------------------------
-# Configuration
+# Configuration (env vars with CLI override)
 # ---------------------------------------------------------------------------
+_DEFAULT_API_BASE = "https://router.huggingface.co/v1"
+_DEFAULT_MODEL = "Qwen/Qwen3-8B"
+_DEFAULT_ENV_URL = "http://localhost:8000"
 
-# Select inference mode: "local" or "endpoint"
-INFERENCE_MODE = os.environ.get("INFERENCE_MODE", "endpoint").lower()
-
-API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-API_KEY = (
-    os.environ.get("API_KEY")
-    or os.environ.get("OPENAI_API_KEY")
-    or os.environ.get("HF_TOKEN")
-)
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
-ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
-
-# Dynamic logging paths
-safe_model_name = MODEL_NAME.replace("/", "_").replace(".", "_")
-LOG_FILE = Path(__file__).resolve().parent / f"logs_{safe_model_name}.txt"
-METRICS_FILE = Path(__file__).resolve().parent / f"metrics_{safe_model_name}.csv"
-
-TASKS = [
+ALL_TASKS = [
     "traffic_spike",
     "node_failure",
     "cascading_failure",
@@ -70,10 +63,10 @@ TASKS = [
 MAX_RETRIES = 4
 BENCHMARK = "distributed_infra_env"
 
-# Global states for models and clients
-tokenizer = None
-model = None
-client: Optional[OpenAI] = None
+# Global states for models and clients (lazy-loaded)
+_tokenizer = None
+_model = None
+_client = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
@@ -129,13 +122,114 @@ Respond using the following STRICT format. You must include the XML reasoning ta
 
 
 # ---------------------------------------------------------------------------
-# CSV Logging Setup for Graphs
+# Structured JSON-lines Logger
 # ---------------------------------------------------------------------------
-def init_metrics_file():
-    if not METRICS_FILE.exists():
-        with open(METRICS_FILE, "w", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(
+class StructuredLogger:
+    """Writes one JSON object per line to a .jsonl file for each episode."""
+
+    def __init__(self, log_dir: Path, model_name: str):
+        self.log_dir = log_dir
+        self.model_name = model_name
+        self._fh = None
+        self._path = None
+
+    def start_episode(self, task_id: str) -> Path:
+        self.close()
+        safe_model = self.model_name.replace("/", "_").replace(".", "_")
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        subdir = self.log_dir / safe_model
+        subdir.mkdir(parents=True, exist_ok=True)
+        self._path = subdir / f"{task_id}_{ts}.jsonl"
+        self._fh = open(self._path, "w", encoding="utf-8", buffering=1)
+        self._write_record(
+            event="episode_start",
+            task_id=task_id,
+            model=self.model_name,
+            timestamp=ts,
+        )
+        return self._path
+
+    def log_step(
+        self,
+        step: int,
+        raw_llm_output: str,
+        parsed_action: dict,
+        backend_action: dict,
+        reward: float,
+        done: bool,
+        task_score: float,
+        obs_snapshot: Optional[dict] = None,
+        error: Optional[str] = None,
+        reasoning: str = "",
+    ):
+        record = {
+            "event": "step",
+            "step": step,
+            "reasoning": reasoning[:500],
+            "raw_llm_output_length": len(raw_llm_output),
+            "parsed_action": parsed_action,
+            "backend_action": backend_action,
+            "reward": round(reward, 4),
+            "done": done,
+            "task_score": round(task_score, 4),
+        }
+        if error:
+            record["error"] = error
+        if obs_snapshot:
+            # Store compact summary of observation
+            record["obs"] = {
+                "latency_ms": obs_snapshot.get("latency_ms"),
+                "failed_nodes": obs_snapshot.get("failed_nodes"),
+                "request_rate": obs_snapshot.get("request_rate"),
+                "error_budget": obs_snapshot.get("error_budget"),
+            }
+        self._write_record(**record)
+
+    def end_episode(
+        self,
+        task_id: str,
+        success: bool,
+        total_steps: int,
+        task_score: float,
+        rewards: List[float],
+    ):
+        self._write_record(
+            event="episode_end",
+            task_id=task_id,
+            success=success,
+            total_steps=total_steps,
+            task_score=round(task_score, 4),
+            reward_mean=round(sum(rewards) / max(len(rewards), 1), 4),
+            reward_min=round(min(rewards) if rewards else 0.0, 4),
+            reward_max=round(max(rewards) if rewards else 0.0, 4),
+            reward_std=round(_std(rewards), 4),
+        )
+        self.close()
+
+    def close(self):
+        if self._fh is not None:
+            self._fh.close()
+            self._fh = None
+
+    def _write_record(self, **kwargs):
+        if self._fh is not None:
+            self._fh.write(json.dumps(kwargs, default=str) + "\n")
+
+
+def _std(xs: List[float]) -> float:
+    if len(xs) < 2:
+        return 0.0
+    mu = sum(xs) / len(xs)
+    return (sum((x - mu) ** 2 for x in xs) / len(xs)) ** 0.5
+
+
+# ---------------------------------------------------------------------------
+# CSV Logging (legacy, kept for backward compatibility)
+# ---------------------------------------------------------------------------
+def _init_csv(path: Path):
+    if not path.exists():
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            csv.writer(f).writerow(
                 [
                     "model",
                     "task_id",
@@ -150,10 +244,9 @@ def init_metrics_file():
             )
 
 
-init_metrics_file()
-
-
-def log_to_csv(
+def _log_csv(
+    path: Path,
+    model: str,
     task_id: str,
     step: int,
     action: str,
@@ -161,17 +254,16 @@ def log_to_csv(
     reward: float,
     score: float,
     done: bool,
-    error: str,
+    error: Optional[str],
 ):
-    with open(METRICS_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(
-            [MODEL_NAME, task_id, step, action, reasoning, reward, score, done, error]
+    with open(path, "a", newline="", encoding="utf-8") as f:
+        csv.writer(f).writerow(
+            [model, task_id, step, action, reasoning, reward, score, done, error]
         )
 
 
 # ---------------------------------------------------------------------------
-# Terminal Logging Functions
+# Terminal Logging (legacy console output + tee to file)
 # ---------------------------------------------------------------------------
 class TeeStream:
     def __init__(self, primary, log_file) -> None:
@@ -208,9 +300,9 @@ def tee_output(log_path: Path):
             sys.stderr = original_stderr
 
 
-def log_start(task: str, env: str, model: str) -> None:
+def log_start(task: str, env: str, model: str, mode: str) -> None:
     print(
-        f"\n[START] task={task} env={env} model={model} mode={INFERENCE_MODE.upper()}",
+        f"\n[START] task={task} env={env} model={model} mode={mode.upper()}",
         flush=True,
     )
 
@@ -235,92 +327,128 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 
 
 # ---------------------------------------------------------------------------
-# Core Logic
+# Model / Client Loading
 # ---------------------------------------------------------------------------
+def _get_api_key() -> Optional[str]:
+    return (
+        os.environ.get("API_KEY")
+        or os.environ.get("OPENAI_API_KEY")
+        or os.environ.get("HF_TOKEN")
+    )
 
 
-def get_client() -> OpenAI:
+def get_client(api_base: str, api_key: str):
     """Initialize the OpenAI client for endpoint inference."""
-    global client
-    if not API_KEY:
-        raise ValueError(
-            "API_KEY environment variable is missing for endpoint inference!"
-        )
-    if client is None:
-        print(
-            f"\n[INFO] Connecting to endpoint {API_BASE_URL} for model {MODEL_NAME}...",
-            flush=True,
-        )
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    return client
+    global _client
+    if _client is None:
+        from openai import OpenAI
+
+        print(f"\n[INFO] Connecting to endpoint {api_base}...", flush=True)
+        _client = OpenAI(base_url=api_base, api_key=api_key)
+    return _client
 
 
-def load_local_model():
+def load_local_model(model_name: str):
     """Load local models via Hugging Face Transformers to GPU."""
-    global tokenizer, model
-    if model is None:
+    global _tokenizer, _model
+    if _model is None:
+        import torch
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
         print(
-            f"\n[INFO] Loading local model {MODEL_NAME} via Transformers to GPU...",
+            f"\n[INFO] Loading local model {model_name} via Transformers to GPU...",
             flush=True,
         )
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-        model = AutoModelForCausalLM.from_pretrained(
-            MODEL_NAME, torch_dtype=torch.bfloat16, device_map="auto"
+        _tokenizer = AutoTokenizer.from_pretrained(model_name)
+        _model = AutoModelForCausalLM.from_pretrained(
+            model_name, torch_dtype=torch.bfloat16, device_map="auto"
         )
+    return _tokenizer, _model
 
 
+# ---------------------------------------------------------------------------
+# LLM Response Parser
+# ---------------------------------------------------------------------------
 def parse_llm_response(text: str) -> Tuple[dict, str]:
-    """Robustly extracts JSON action and reasoning, handling markdown and loose formatting."""
-    reasoning = "No reasoning provided."
-    action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
+    """
+    Robustly extracts JSON action and reasoning from LLM output.
 
-    # Use the <think> block as reasoning if present
+    Handles: <think>/<reasoning> blocks, markdown code fences, loose JSON,
+    double-escaped strings, and missing XML tags.
+    """
+    reasoning = "No reasoning provided."
+    action_dict: dict = {"action_type": "no_op", "kubectl_command": "no_op"}
+
+    # 1. Extract <think> block as primary reasoning
     think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
     if think_match:
         reasoning = think_match.group(1).strip()
 
     # Strip think block before parsing action tags
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    text_stripped = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
 
-    # Extract <reasoning> tag only as fallback if no think block
+    # 2. Extract <reasoning> tag as fallback
     if reasoning == "No reasoning provided.":
         res_match = re.search(
-            r"<reasoning>\s*(.*?)\s*</reasoning>", text, re.IGNORECASE | re.DOTALL
+            r"<reasoning>\s*(.*?)\s*</reasoning>",
+            text_stripped,
+            re.IGNORECASE | re.DOTALL,
         )
         if res_match:
             reasoning = res_match.group(1).strip()
 
-    # Extract Action block safely
+    # 3. Extract Action block
     act_match = re.search(
-        r"<action>\s*(.*?)\s*</action>", text, re.IGNORECASE | re.DOTALL
+        r"<action>\s*(.*?)\s*</action>", text_stripped, re.IGNORECASE | re.DOTALL
     )
-    json_text = act_match.group(1) if act_match else text
+    json_text = act_match.group(1) if act_match else text_stripped
 
-    # Strip everything outside the outermost JSON brackets if tags failed
+    # 4. Extract JSON from content (handles markdown code fences)
+    # Strip markdown code fences
+    json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
+    json_text = json_text.replace("```", "").strip()
+
+    # Find outermost JSON braces
     start_idx = json_text.find("{")
     end_idx = json_text.rfind("}")
     if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
         json_text = json_text[start_idx : end_idx + 1]
     else:
-        json_text = '{"command": "no_op"}'
+        # Try extracting a bare kubectl command
+        cmd_match = re.search(r"(kubectl\s+\S+.*?)(?:\n|$)", json_text, re.IGNORECASE)
+        if cmd_match:
+            json_text = json.dumps({"command": cmd_match.group(1).strip()})
+        else:
+            json_text = '{"command": "no_op"}'
 
-    # Clean up markdown code blocks if the LLM added them
-    json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
-    json_text = json_text.replace("```", "").strip()
-
+    # 5. Parse JSON with multiple fallbacks
     try:
         action_dict = json.loads(json_text)
     except json.JSONDecodeError:
+        # Try fixing common LLM JSON errors
         try:
-            action_dict = ast.literal_eval(json_text)
-        except Exception as e:
-            action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
-    except Exception as e:
-        action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
+            # Handle single quotes
+            fixed = json_text.replace("'", '"')
+            action_dict = json.loads(fixed)
+        except json.JSONDecodeError:
+            try:
+                action_dict = ast.literal_eval(json_text)
+            except Exception:
+                # Extract command from raw text as last resort
+                cmd_match = re.search(
+                    r"(kubectl\s+\S+.*?)(?:\"|'|$)", json_text, re.IGNORECASE
+                )
+                if cmd_match:
+                    action_dict = {"command": cmd_match.group(1).strip()}
+                else:
+                    action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
 
     return action_dict, reasoning
 
 
+# ---------------------------------------------------------------------------
+# Safe Backend Action Builder
+# ---------------------------------------------------------------------------
 def build_safe_backend_action(action_dict: dict) -> dict:
     """
     STRICT RECONSTRUCTOR: Prevents FastAPI 422 Errors.
@@ -337,7 +465,7 @@ def build_safe_backend_action(action_dict: dict) -> dict:
     safe_action = {"action_type": action_dict.get("action_type", "no_op")}
     act_type = safe_action["action_type"]
 
-    if act_type == "restart_node" or act_type == "query_logs":
+    if act_type in ("restart_node", "query_logs"):
         try:
             safe_action["target"] = int(action_dict.get("target", 0))
         except (ValueError, TypeError):
@@ -357,13 +485,28 @@ def build_safe_backend_action(action_dict: dict) -> dict:
         except (ValueError, TypeError):
             safe_action["rate"] = 1.0
 
-    elif act_type not in ["scale_up", "no_op"]:
+    elif act_type not in ("scale_up", "no_op"):
         safe_action["action_type"] = "no_op"
 
     return safe_action
 
 
-def llm_decide(observation: dict) -> Tuple[dict, str]:
+# ---------------------------------------------------------------------------
+# LLM Decision Maker
+# ---------------------------------------------------------------------------
+def llm_decide(
+    observation: dict,
+    model_name: str,
+    mode: str,
+    api_base: str,
+    api_key: Optional[str],
+) -> Tuple[dict, str, str]:
+    """
+    Query the LLM for a decision based on the current observation.
+
+    Returns:
+        (action_dict, reasoning, raw_output)
+    """
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
 
@@ -377,8 +520,10 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
             content = ""
 
             # --- LOCAL GPU INFERENCE ---
-            if INFERENCE_MODE == "local":
-                load_local_model()
+            if mode == "local":
+                import torch
+
+                tokenizer, model = load_local_model(model_name)
 
                 try:
                     prompt = tokenizer.apply_chat_template(
@@ -388,7 +533,6 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
                         enable_thinking=True,
                     )
                 except TypeError:
-                    # Fallback if tokenizer doesn't support enable_thinking arg
                     prompt = tokenizer.apply_chat_template(
                         messages, tokenize=False, add_generation_prompt=True
                     )
@@ -411,10 +555,15 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
                 ).strip()
 
             # --- REMOTE ENDPOINT INFERENCE ---
-            elif INFERENCE_MODE == "endpoint":
-                api_client = get_client()
+            elif mode == "endpoint":
+                if not api_key:
+                    raise ValueError(
+                        "API_KEY is missing for endpoint inference! "
+                        "Set API_KEY, OPENAI_API_KEY, or HF_TOKEN."
+                    )
+                api_client = get_client(api_base, api_key)
                 response = api_client.chat.completions.create(
-                    model=MODEL_NAME,
+                    model=model_name,
                     messages=messages,
                     max_tokens=4000,
                     temperature=0.7,
@@ -424,43 +573,46 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
 
             else:
                 raise ValueError(
-                    f"Unknown INFERENCE_MODE: {INFERENCE_MODE}. Must be 'local' or 'endpoint'."
+                    f"Unknown inference mode: {mode}. Must be 'local' or 'endpoint'."
                 )
 
             action_dict, reasoning = parse_llm_response(content)
 
-            print("\n[DEBUG RAW OUTPUT]\n", content, "\n", flush=True)
+            print("\n[DEBUG RAW OUTPUT]\n", content[:500], "\n", flush=True)
 
             if (
                 "action_type" in action_dict
                 or "command" in action_dict
                 or "raw_command" in action_dict
             ):
-                return action_dict, reasoning
+                return action_dict, reasoning, content
 
         except Exception as e:
-            # Exponential Backoff for API rate limits
             wait_time = 2 ** (attempt + 1)
             print(
-                f"[WARNING] Inference call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
+                f"[WARNING] Inference call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)[:200]}",
                 flush=True,
             )
-            if INFERENCE_MODE == "endpoint":
+            if mode == "endpoint":
                 print(f"[DEBUG] Retrying in {wait_time} seconds...", flush=True)
                 time.sleep(wait_time)
 
     print("[ERROR] Inference repeatedly failed. Skipping turn with no_op.", flush=True)
-    return {
-        "action_type": "no_op",
-        "kubectl_command": "no_op",
-    }, "Inference Error - Fallback to no_op"
+    return (
+        {"action_type": "no_op", "kubectl_command": "no_op"},
+        "Inference Error - Fallback to no_op",
+        "",
+    )
 
 
-def env_reset(task_id: str) -> dict:
+# ---------------------------------------------------------------------------
+# Environment Communication
+# ---------------------------------------------------------------------------
+def env_reset(env_url: str, task_id: str) -> dict:
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.post(
-                f"{ENV_SERVER_URL}/reset", json={"task": task_id}, timeout=15
+                f"{env_url}/reset", json={"task": task_id}, timeout=15
             )
             response.raise_for_status()
             payload = response.json()
@@ -470,35 +622,52 @@ def env_reset(task_id: str) -> dict:
             ):
                 return data_block["observation"]
             return data_block
-        except Exception as e:
+        except Exception:
             time.sleep(2**attempt)
     raise ConnectionError(f"Failed to reset environment after {MAX_RETRIES} attempts.")
 
 
-def env_step(action: dict) -> dict:
+def env_step(env_url: str, action: dict) -> dict:
     for attempt in range(MAX_RETRIES):
         try:
             response = requests.post(
-                f"{ENV_SERVER_URL}/step", json={"action": action}, timeout=15
+                f"{env_url}/step", json={"action": action}, timeout=15
             )
             response.raise_for_status()
             return response.json()
-        except Exception as e:
+        except Exception:
             time.sleep(2**attempt)
     raise ConnectionError(f"Failed to step environment after {MAX_RETRIES} attempts.")
 
 
-def run_task(task_id: str) -> dict:
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+# ---------------------------------------------------------------------------
+# Task Runner
+# ---------------------------------------------------------------------------
+def run_task(
+    task_id: str,
+    *,
+    model_name: str,
+    mode: str,
+    api_base: str,
+    api_key: Optional[str],
+    env_url: str,
+    csv_path: Path,
+    structured_logger: StructuredLogger,
+    max_episode_steps: int = 100,
+) -> dict:
+    log_start(task=task_id, env=BENCHMARK, model=model_name, mode=mode)
+    episode_path = structured_logger.start_episode(task_id)
+    print(f"[INFO] Structured log: {episode_path}", flush=True)
 
     try:
-        obs = env_reset(task_id)
+        obs = env_reset(env_url, task_id)
     except Exception as e:
         print(
             f"[FATAL ERROR] Failed to connect to environment server for task '{task_id}': {e}",
             flush=True,
         )
         log_end(success=False, steps=0, score=0.0, rewards=[])
+        structured_logger.end_episode(task_id, False, 0, 0.0, [])
         return {
             "task": task_id,
             "score": 0.0,
@@ -508,15 +677,15 @@ def run_task(task_id: str) -> dict:
         }
 
     step = 0
-    rewards_list = []
-    latencies = []
-    uptimes = []
+    rewards_list: List[float] = []
+    latencies: List[float] = []
+    uptimes: List[float] = []
     task_score = 0.0
 
     while True:
         step += 1
 
-        # Track metrics
+        # Track metrics from observation
         lat = float(obs.get("latency_ms", 0.0))
         up = float(obs.get("uptime_pct", 0.0))
         if lat > 0:
@@ -524,15 +693,17 @@ def run_task(task_id: str) -> dict:
         if up > 0:
             uptimes.append(up)
 
-        # 1. Get the action dict and the reasoning string
-        action_dict, reasoning = llm_decide(obs)
+        # 1. Get the action dict, reasoning, and raw output
+        action_dict, reasoning, raw_output = llm_decide(
+            obs, model_name, mode, api_base, api_key
+        )
 
-        # 2. Stringify full action for CSV & format clean string for terminal
+        # 2. Stringify for logging
         action_str = json.dumps(action_dict).replace('"', "'")
         reasoning_clean = reasoning.replace("\n", " ")
         terminal_action_str = f"act={action_str} | rsn='{reasoning_clean[:90]}...'"
 
-        # 3. Use the strict reconstructor to get the perfect backend payload
+        # 3. Build safe backend payload
         backend_action = build_safe_backend_action(action_dict)
 
         error_msg = None
@@ -540,7 +711,7 @@ def run_task(task_id: str) -> dict:
         done = False
 
         try:
-            result = env_step(backend_action)
+            result = env_step(env_url, backend_action)
             data_block = result.get("data", result)
 
             if "observation" in data_block and isinstance(
@@ -560,7 +731,7 @@ def run_task(task_id: str) -> dict:
 
         rewards_list.append(reward)
 
-        # Log to outputs
+        # Log to all outputs
         log_step(
             step=step,
             action=terminal_action_str,
@@ -568,13 +739,37 @@ def run_task(task_id: str) -> dict:
             done=done,
             error=error_msg,
         )
-        log_to_csv(
-            task_id, step, action_str, reasoning, reward, task_score, done, error_msg
+        _log_csv(
+            csv_path,
+            model_name,
+            task_id,
+            step,
+            action_str,
+            reasoning,
+            reward,
+            task_score,
+            done,
+            error_msg,
+        )
+        structured_logger.log_step(
+            step=step,
+            raw_llm_output=raw_output,
+            parsed_action=action_dict,
+            backend_action=backend_action,
+            reward=reward,
+            done=done,
+            task_score=task_score,
+            obs_snapshot=obs if isinstance(obs, dict) else None,
+            error=error_msg,
+            reasoning=reasoning,
         )
 
-        if done or step > 100:
+        if done or step > max_episode_steps:
             success = task_score >= 0.1
             log_end(success=success, steps=step, score=task_score, rewards=rewards_list)
+            structured_logger.end_episode(
+                task_id, success, step, task_score, rewards_list
+            )
 
             avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
             avg_up = sum(uptimes) / len(uptimes) if uptimes else 0.0
@@ -588,26 +783,112 @@ def run_task(task_id: str) -> dict:
             }
 
 
+# ---------------------------------------------------------------------------
+# CLI Argument Parser
+# ---------------------------------------------------------------------------
+def build_arg_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        description="DIME LLM Agent Inference Loop",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument(
+        "--mode",
+        choices=["local", "endpoint"],
+        default=os.environ.get("INFERENCE_MODE", "endpoint").lower(),
+        help="Inference mode: local GPU or remote endpoint (default: endpoint)",
+    )
+    p.add_argument(
+        "--model",
+        default=os.environ.get("MODEL_NAME", _DEFAULT_MODEL),
+        help=f"Model name/path (default: {_DEFAULT_MODEL})",
+    )
+    p.add_argument(
+        "--api-base",
+        default=os.environ.get("API_BASE_URL", _DEFAULT_API_BASE),
+        help="API base URL for endpoint mode",
+    )
+    p.add_argument(
+        "--env-url",
+        default=os.environ.get("ENV_SERVER_URL", _DEFAULT_ENV_URL),
+        help="Environment server URL",
+    )
+    p.add_argument(
+        "--tasks",
+        nargs="+",
+        default=None,
+        help="Tasks to run (default: all tasks)",
+    )
+    p.add_argument(
+        "--max-steps",
+        type=int,
+        default=100,
+        help="Max steps per episode (default: 100)",
+    )
+    p.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory for structured JSON logs (default: ./logs/)",
+    )
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Main Entry Point
+# ---------------------------------------------------------------------------
 def main():
-    print(f"API KEY LOADED:", API_KEY[:10] if API_KEY else "Missing or Running Local!")
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    model_name = args.model
+    mode = args.mode
+    api_base = args.api_base
+    api_key = _get_api_key()
+    env_url = args.env_url
+    tasks = args.tasks or ALL_TASKS
+    max_steps = args.max_steps
+
+    # Setup paths
+    project_root = Path(__file__).resolve().parent
+    safe_model_name = model_name.replace("/", "_").replace(".", "_")
+    log_file = project_root / f"logs_{safe_model_name}.txt"
+    csv_file = project_root / f"metrics_{safe_model_name}.csv"
+    log_dir = Path(args.log_dir) if args.log_dir else project_root / "logs"
+
+    _init_csv(csv_file)
+    structured_logger = StructuredLogger(log_dir, model_name)
+
+    print(f"API KEY LOADED: {api_key[:10] if api_key else 'Missing or Running Local!'}")
 
     all_task_stats = []
 
-    with tee_output(LOG_FILE):
-        print(f"==================================================")
-        print(f"  STARTING DIME EVALUATION SESSION: {MODEL_NAME}")
-        print(f"  MODE: {INFERENCE_MODE.upper()}")
-        print(f"==================================================")
+    with tee_output(log_file):
+        print("==================================================")
+        print(f"  STARTING DIME EVALUATION SESSION: {model_name}")
+        print(f"  MODE: {mode.upper()}")
+        print(f"  TASKS: {len(tasks)}")
+        print(f"  STRUCTURED LOGS: {log_dir}")
+        print("==================================================")
 
-        for task_id in TASKS:
-            stats = run_task(task_id)
+        for task_id in tasks:
+            stats = run_task(
+                task_id,
+                model_name=model_name,
+                mode=mode,
+                api_base=api_base,
+                api_key=api_key,
+                env_url=env_url,
+                csv_path=csv_file,
+                structured_logger=structured_logger,
+                max_episode_steps=max_steps,
+            )
             all_task_stats.append(stats)
 
         # -----------------------------------------------------------
         # FINAL STRUCTURED SUMMARY FOR JUDGES
         # -----------------------------------------------------------
         print("\n" + "=" * 80)
-        print(f"FINAL PERFORMANCE SUMMARY: {MODEL_NAME}")
+        print(f"FINAL PERFORMANCE SUMMARY: {model_name}")
         print("=" * 80)
         print(
             f"{'Task Name':<25} | {'Task Score':<12} | {'Uptime %':<12} | {'Avg Latency (ms)':<15}"
@@ -640,8 +921,11 @@ def main():
         print("=" * 80)
         print(f"OVERALL DIME INDEX (Higher=Better): {dime_index:.4f}")
         print("=" * 80)
-        print(f"Logs saved to: {LOG_FILE}")
-        print(f"Metrics saved to: {METRICS_FILE}")
+        print(f"Logs saved to: {log_file}")
+        print(f"Metrics saved to: {csv_file}")
+        print(f"Structured logs: {log_dir}")
+
+    structured_logger.close()
 
 
 if __name__ == "__main__":
