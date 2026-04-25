@@ -1,0 +1,7 @@
+==================================================
+  STARTING DIME EVALUATION SESSION: meta-llama/Llama-3.1-8B-Instruct
+==================================================
+
+[START] task=traffic_spike env=distributed_infra_env model=meta-llama/Llama-3.1-8B-Instruct
+
+[INFO] Loading local model meta-llama/Llama-3.1-8B-Instruct via Transformers to GPU...

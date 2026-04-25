@@ -22,7 +22,8 @@ import requests
 from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
-from openai import OpenAI
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 load_dotenv()
 
@@ -36,7 +37,7 @@ API_KEY = (
     or os.environ.get("OPENAI_API_KEY")
     or os.environ.get("HF_TOKEN")
 )
-MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-8B")
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:8000")
 
 # Dynamic logging paths
@@ -63,7 +64,8 @@ TASKS = [
 MAX_RETRIES = 4
 BENCHMARK = "distributed_infra_env"
 
-client: Optional[OpenAI] = None
+tokenizer = None
+model = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
@@ -226,26 +228,45 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # ---------------------------------------------------------------------------
 
 
-def get_client() -> OpenAI:
-    global client
-    if not API_KEY:
-        raise ValueError("API_KEY environment variable is missing!")
-    if client is None:
-        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
-    return client
+# def get_client() -> OpenAI:
+#     global client
+#     if not API_KEY:
+#         raise ValueError("API_KEY environment variable is missing!")
+#     if client is None:
+#         client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+#     return client
 
+def load_local_model():
+    global tokenizer, model
+    if model is None:
+        print(f"\n[INFO] Loading local model {MODEL_NAME} via Transformers to GPU...", flush=True)
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_NAME,
+            torch_dtype=torch.bfloat16,
+            device_map="auto"
+        )
 
 def parse_llm_response(text: str) -> Tuple[dict, str]:
     """Robustly extracts JSON action and reasoning, handling markdown and loose formatting."""
     reasoning = "No reasoning provided."
     action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
 
-    # Extract reasoning safely
-    res_match = re.search(
-        r"<reasoning>\s*(.*?)\s*</reasoning>", text, re.IGNORECASE | re.DOTALL
-    )
-    if res_match:
-        reasoning = res_match.group(1).strip()
+    # Use the <think> block as reasoning if present
+    think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL)
+    if think_match:
+        reasoning = think_match.group(1).strip()
+
+    # Strip think block before parsing action tags
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+
+    # Extract <reasoning> tag only as fallback if no think block
+    if reasoning == "No reasoning provided.":
+        res_match = re.search(
+            r"<reasoning>\s*(.*?)\s*</reasoning>", text, re.IGNORECASE | re.DOTALL
+        )
+        if res_match:
+            reasoning = res_match.group(1).strip()
 
     # Extract Action block safely
     act_match = re.search(
@@ -259,22 +280,26 @@ def parse_llm_response(text: str) -> Tuple[dict, str]:
     if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
         json_text = json_text[start_idx : end_idx + 1]
     else:
-        json_text = '{"command": "no_op"}'  # Total failure fallback
+        json_text = '{"command": "no_op"}'
+        print("[DEBUG] RAW TEXT:", text)
+        raise ValueError("Model output unparsable")
 
     # Clean up markdown code blocks if the LLM added them
     json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
     json_text = json_text.replace("```", "").strip()
 
     try:
+        action_dict = json.loads(json_text)
+    except json.JSONDecodeError:
         try:
-            action_dict = json.loads(json_text)
-        except json.JSONDecodeError:
             action_dict = ast.literal_eval(json_text)
+        except Exception as e:
+            print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
+            action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
     except Exception as e:
         print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
 
     return action_dict, reasoning
-
 
 def build_safe_backend_action(action_dict: dict) -> dict:
     """
@@ -322,44 +347,68 @@ def build_safe_backend_action(action_dict: dict) -> dict:
 
     return safe_action
 
-
 def llm_decide(observation: dict) -> Tuple[dict, str]:
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
 
+    # Load the model (the function ensures it only loads once)
+    load_local_model()
+
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": user_prompt},
+    ]
+
     for attempt in range(MAX_RETRIES):
         try:
-            response = get_client().chat.completions.create(
-                model=MODEL_NAME,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": user_prompt},
-                ],
-                max_tokens=400,
-                temperature=0.01,
+            # Apply the official Llama-3 chat template
+            prompt = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True
             )
-            content = response.choices[0].message.content.strip()
+            
+            # Move inputs to the GPU
+            inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+            # Generate (using greedy decoding since temperature was ~0.01)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs,
+                    max_new_tokens=4096,
+                    do_sample=True,
+                    temperature=0.7,
+                    top_p=0.9,
+                    pad_token_id=tokenizer.eos_token_id
+                )
+
+            # Extract ONLY the newly generated text (ignoring the input prompt)
+            input_length = inputs.input_ids.shape[1]
+            content = tokenizer.decode(outputs[0][input_length:], skip_special_tokens=True).strip()
+            
             action_dict, reasoning = parse_llm_response(content)
 
-            if "action_type" in action_dict or "command" in action_dict:
+            print("\n[DEBUG RAW OUTPUT]\n", content, "\n", flush=True)
+
+            if "action_type" in action_dict or "command" in action_dict or "raw_command" in action_dict:
                 return action_dict, reasoning
 
         except Exception as e:
             # Exponential Backoff (2s, 4s, 8s, 16s)
             wait_time = 2 ** (attempt + 1)
             print(
-                f"[WARNING] API call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
+                f"[WARNING] Inference call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
                 flush=True,
             )
             print(f"[DEBUG] Retrying in {wait_time} seconds...", flush=True)
             time.sleep(wait_time)
 
-    print("[ERROR] API repeatedly failed. Skipping turn with no_op.", flush=True)
+    print("[ERROR] Inference repeatedly failed. Skipping turn with no_op.", flush=True)
     return {
         "action_type": "no_op",
         "kubectl_command": "no_op",
-    }, "API Error - Fallback to no_op"
-
+    }, "Inference Error - Fallback to no_op"
 
 def env_reset(task_id: str) -> dict:
     for attempt in range(MAX_RETRIES):
