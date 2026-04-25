@@ -10,7 +10,11 @@ Updated to use kubectl/AWS CLI command syntax (real-world action schemas).
 
 import json
 import os
+import sys
 import time
+import traceback
+from contextlib import contextmanager
+from pathlib import Path
 import requests
 from typing import List, Optional
 from openai import OpenAI
@@ -22,12 +26,11 @@ from openai import OpenAI
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
 
 API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
-if not API_KEY:
-    raise ValueError("API_KEY or HF_TOKEN environment variable is missing!")
 
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
 
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:7860")
+LOG_FILE = Path(__file__).resolve().parent / "logs.txt"
 
 TASKS = [
     "traffic_spike",
@@ -39,7 +42,7 @@ TASKS = [
 MAX_RETRIES = 3
 BENCHMARK = "distributed_infra_env"
 
-client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+client: Optional[OpenAI] = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
 You receive observations about the system state as JSON and must respond with a SINGLE kubectl command.
@@ -91,6 +94,43 @@ Respond with ONLY the kubectl command or "no_op". No markdown, no explanation.""
 # ---------------------------------------------------------------------------
 
 
+class TeeStream:
+    """Write stream output to the terminal and a log file."""
+
+    def __init__(self, primary, log_file) -> None:
+        self.primary = primary
+        self.log_file = log_file
+        self.encoding = getattr(primary, "encoding", "utf-8")
+        self.errors = getattr(primary, "errors", "replace")
+
+    def write(self, data: str) -> int:
+        self.primary.write(data)
+        self.log_file.write(data)
+        return len(data)
+
+    def flush(self) -> None:
+        self.primary.flush()
+        self.log_file.flush()
+
+    def isatty(self) -> bool:
+        return self.primary.isatty()
+
+
+@contextmanager
+def tee_output(log_path: Path):
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w", encoding="utf-8", buffering=1) as log_file:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = TeeStream(original_stdout, log_file)
+        sys.stderr = TeeStream(original_stderr, log_file)
+        try:
+            yield
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+
+
 def log_start(task: str, env: str, model: str) -> None:
     print(f"[START] task={task} env={env} model={model}", flush=True)
 
@@ -119,13 +159,22 @@ def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> No
 # ---------------------------------------------------------------------------
 
 
+def get_client() -> OpenAI:
+    global client
+    if not API_KEY:
+        raise ValueError("API_KEY or HF_TOKEN environment variable is missing!")
+    if client is None:
+        client = OpenAI(base_url=API_BASE_URL, api_key=API_KEY)
+    return client
+
+
 def llm_decide(observation: dict) -> dict:
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with ONLY a kubectl command or 'no_op'."
 
     for attempt in range(MAX_RETRIES):
         try:
-            response = client.chat.completions.create(
+            response = get_client().chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -244,4 +293,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    with tee_output(LOG_FILE):
+        try:
+            main()
+        except Exception:
+            traceback.print_exc()
+            raise SystemExit(1)
