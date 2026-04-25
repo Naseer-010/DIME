@@ -1,9 +1,10 @@
-#!/usr/bin/env python3
+##!/usr/bin/env python3
 """
-LLM Agent Inference Loop for Distributed Infrastructure Environment.
+LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
 
-Combines CoT (Chain-of-Thought) reasoning, crash-prevention (422 bypass),
-CSV metric logging for plotting, and a structured SRE DIME Index summary.
+Evaluates the autonomous reasoning capabilities of LLMs for SRE tasks.
+Features CoT reasoning, exponential backoff retries, CSV metric logging,
+and hybrid JSON/kubectl action outputs.
 """
 
 import json
@@ -13,6 +14,7 @@ import time
 import traceback
 import math
 import csv
+import re
 from contextlib import contextmanager
 from pathlib import Path
 import requests
@@ -48,47 +50,37 @@ TASKS = [
     "flash_crowd",
     "level_5_alibaba_trace",
 ]
-MAX_RETRIES = 3
+MAX_RETRIES = 4
 BENCHMARK = "distributed_infra_env"
 
 client: Optional[OpenAI] = None
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a Kubernetes cluster.
-You receive observations about the system state as JSON and must respond with a command.
+# THE NEW PROMPT: No cheat-sheets. Just the environment rules and objectives.
+SYSTEM_PROMPT = """You are an autonomous AI Site Reliability Engineer (SRE) managing a distributed cluster.
+You receive observations about the system state as JSON and must decide the best action to maintain system health.
 
 CLUSTER ARCHITECTURE:
-- Node 0 (worker-0) is the DATABASE — all request processing requires a DB query.
-  If the DB is overloaded or fails, ALL app servers stop processing.
-- Nodes 1-7 (worker-1 through worker-7) are APP SERVERS — they receive external traffic.
-- New nodes from scale_up have a 3-STEP COLD START (10% processing speed during boot).
+- Node 0 is the DATABASE — a single point of failure. If it fails, all processing stops.
+- Nodes 1-7 are APP SERVERS.
+- Scaling up adds new nodes, but they have a 3-step cold start.
 
-Available commands:
-- kubectl delete pod node-<ID>           → restart a failed node
-- kubectl scale deployment frontend --replicas=<N>  → scale up capacity (costs 1 budget unit, 3-step cold start)
-- kubectl exec -it istio-proxy -- traffic shift --from=<ID> --to=<ID>  → reroute traffic
-- kubectl throttle ingress --rate=<float>  → throttle incoming requests (0.0-1.0)
-- kubectl logs node-<ID>                 → investigate a node with telemetry timeout
-- no_op                                  → do nothing
+YOUR OBJECTIVES:
+1. Maximize Uptime: Prevent node failures by reducing extreme CPU loads and restarting failed nodes immediately.
+2. Minimize Latency: Keep average latency low by scaling up or throttling when necessary.
+3. Conserve Budget: Do not scale up unnecessarily. Cloud budget is limited.
+4. Maintain Throughput: Do not throttle traffic unnecessarily. Dropping too much traffic causes a massive penalty.
 
-CONSTRAINTS:
-- Cloud budget is LIMITED. Check cloud_budget before scaling.
-- Restart has a 5-step cooldown per node.
-- NEVER set throttle rate below 0.3 — dropping >70% of traffic causes a massive throughput penalty.
+AVAILABLE ACTIONS (Must output exactly one of these JSON objects):
+1. Restart a failed node: {"action_type": "restart_node", "target": <node_index>, "kubectl_command": "kubectl delete pod node-<node_index>"}
+2. Scale up capacity: {"action_type": "scale_up", "kubectl_command": "kubectl scale deployment frontend --replicas=10"}
+3. Reroute traffic: {"action_type": "reroute_traffic", "from_node": <index>, "to_node": <index>, "kubectl_command": "kubectl exec -it istio-proxy -- traffic shift --from=<from_node> --to=<to_node>"}
+4. Throttle ingress: {"action_type": "throttle", "rate": <float between 0.3 and 1.0>, "kubectl_command": "kubectl throttle ingress --rate=<rate>"}
+5. Do nothing: {"action_type": "no_op", "kubectl_command": "no_op"}
 
-CRITICAL DECISION TREE (Follow strictly):
-1. IF 'action_errors' contains "CRITICAL: Database node failed": IMMEDIATELY output: kubectl delete pod node-0
-2. IF any node has telemetry "timeout" (cpu_load == -1): Output: kubectl logs node-<ID>
-3. IF 'failed_nodes' is not empty: IMMEDIATELY output: kubectl delete pod node-<failed_node_index>
-4. IF node-0 (DB) cpu_load > 0.75: RELIEVE DB PRESSURE: kubectl throttle ingress --rate=0.7
-5. IF any app server cpu_load > 0.85: Find the node with highest CPU and lowest CPU among app servers. Output: kubectl exec -it istio-proxy -- traffic shift --from=<high> --to=<low>
-6. IF average cpu_loads > 0.70 AND cloud_budget > 0: Output: kubectl scale deployment frontend --replicas=10
-7. IF 'latency_ms' > 45.0: Output: kubectl throttle ingress --rate=0.8
-8. IF none of the above are true: Output: no_op
-
-Respond using the following STRICT format. You must include the XML reasoning tags:
-<reasoning>Briefly explain your diagnostic thought process here.</reasoning>
+Respond using the following STRICT format. 
+<reasoning>Analyze the current metrics, identify risks, and explain your strategy based on the objectives.</reasoning>
 <action>
-{"command": "your_kubectl_command_or_no_op_here"}
+{"action_type": "...", "kubectl_command": "..."}
 </action>"""
 
 
@@ -205,6 +197,23 @@ def get_client() -> OpenAI:
     return client
 
 
+def extract_json_action(text: str) -> dict:
+    """Safely extracts the JSON object from the <action> tags."""
+    try:
+        match = re.search(r"<action>\s*({.*?})\s*</action>", text, re.DOTALL)
+        if match:
+            return json.loads(match.group(1))
+
+        match = re.search(r'({[^{}]*"action_type"[^{}]*})', text)
+        if match:
+            return json.loads(match.group(1))
+
+    except json.JSONDecodeError:
+        pass
+
+    return {"action_type": "no_op", "kubectl_command": "no_op"}
+
+
 def llm_decide(observation: dict) -> dict:
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
@@ -221,37 +230,55 @@ def llm_decide(observation: dict) -> dict:
                 temperature=0.01,
             )
             content = response.choices[0].message.content.strip()
+            parsed_action = extract_json_action(content)
 
-            # THE 422 BYPASS: Send raw string. backend command_parser extracts the XML.
-            return {"action_type": "no_op", "raw_command": content}
+            if "action_type" in parsed_action:
+                return parsed_action
 
         except Exception as e:
+            # Exponential Backoff (2s, 4s, 8s, 16s)
+            wait_time = 2 ** (attempt + 1)
             print(
-                f"[DEBUG] LLM call attempt {attempt + 1} failed: {str(e)}", flush=True
+                f"[WARNING] API call failed (Attempt {attempt + 1}/{MAX_RETRIES}): {str(e)}",
+                flush=True,
             )
-            time.sleep(1)
+            print(f"[DEBUG] Retrying in {wait_time} seconds...", flush=True)
+            time.sleep(wait_time)
 
-    return {"action_type": "no_op"}
+    print("[ERROR] API repeatedly failed. Skipping turn with no_op.", flush=True)
+    return {"action_type": "no_op", "kubectl_command": "no_op"}
 
 
 def env_reset(task_id: str) -> dict:
-    response = requests.post(
-        f"{ENV_SERVER_URL}/reset", json={"task": task_id}, timeout=10
-    )
-    response.raise_for_status()
-    payload = response.json()
-    data_block = payload.get("data", payload)
-    if "observation" in data_block and isinstance(data_block["observation"], dict):
-        return data_block["observation"]
-    return data_block
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                f"{ENV_SERVER_URL}/reset", json={"task": task_id}, timeout=15
+            )
+            response.raise_for_status()
+            payload = response.json()
+            data_block = payload.get("data", payload)
+            if "observation" in data_block and isinstance(
+                data_block["observation"], dict
+            ):
+                return data_block["observation"]
+            return data_block
+        except Exception as e:
+            time.sleep(2**attempt)
+    raise ConnectionError(f"Failed to reset environment after {MAX_RETRIES} attempts.")
 
 
 def env_step(action: dict) -> dict:
-    response = requests.post(
-        f"{ENV_SERVER_URL}/step", json={"action": action}, timeout=10
-    )
-    response.raise_for_status()
-    return response.json()
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                f"{ENV_SERVER_URL}/step", json={"action": action}, timeout=15
+            )
+            response.raise_for_status()
+            return response.json()
+        except Exception as e:
+            time.sleep(2**attempt)
+    raise ConnectionError(f"Failed to step environment after {MAX_RETRIES} attempts.")
 
 
 def run_task(task_id: str) -> dict:
@@ -290,15 +317,22 @@ def run_task(task_id: str) -> dict:
         if up > 0:
             uptimes.append(up)
 
+        # 1. Get the full combined dictionary from the LLM
         action = llm_decide(obs)
+
+        # 2. Stringify the FULL action (including kubectl_command) for perfect logs
         action_str = json.dumps(action).replace('"', "'")
+
+        # 3. Strip out 'kubectl_command' so Pydantic backend doesn't crash with a 422
+        backend_action = {k: v for k, v in action.items() if k != "kubectl_command"}
 
         error_msg = None
         reward = 0.0
         done = False
 
         try:
-            result = env_step(action)
+            # Send the clean version to the server
+            result = env_step(backend_action)
             data_block = result.get("data", result)
 
             if "observation" in data_block and isinstance(
@@ -318,7 +352,7 @@ def run_task(task_id: str) -> dict:
 
         rewards_list.append(reward)
 
-        # Write to outputs
+        # Write to outputs using the FULL action string
         log_step(
             step=step, action=action_str, reward=reward, done=done, error=error_msg
         )
