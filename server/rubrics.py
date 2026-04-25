@@ -114,6 +114,26 @@ class EfficiencyVerifier:
         return self.penalty if avg_cpu < self.cpu_threshold else 0.0
 
 
+@dataclass
+class ThroughputVerifier:
+    """
+    -0.5 penalty if the agent drops more than 70 % of traffic via throttle.
+
+    Patches the "zero-service" exploit where an agent sets throttle to 0.0,
+    emptying queues and achieving low latency / high uptime while serving
+    nothing.
+    """
+
+    name: str = "throughput"
+    penalty: float = -0.5
+    min_throughput_ratio: float = 0.30  # must serve ≥30% of traffic
+
+    def score(self, sim: "SimulationState") -> float:
+        if sim.throttle_rate < self.min_throughput_ratio:
+            return self.penalty
+        return 0.0
+
+
 # ---------------------------------------------------------------------------
 # Default rubric set & composite reward
 # ---------------------------------------------------------------------------
@@ -123,6 +143,7 @@ DEFAULT_RUBRICS: List[Verifier] = [
     StabilityVerifier(),
     SLAVerifier(),
     EfficiencyVerifier(),
+    ThroughputVerifier(),
 ]
 
 

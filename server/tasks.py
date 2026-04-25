@@ -314,6 +314,84 @@ _is_done_level_4 = _is_done_flash_crowd
 
 
 # ============================================================================
+# Level 5 — Alibaba Trace Replay (Real-World Production Traffic)
+# ============================================================================
+
+
+def _setup_alibaba_trace(env: "DistributedInfraEnvironment", rng: "random.Random"):
+    """Load real Alibaba cluster trace and replay it step-by-step."""
+    from server.trace_loader import load_default_trace
+
+    sim = env.sim
+    sim.max_steps = 60  # ~30 minutes of real time at 30s intervals
+    sim.cloud_budget = 8  # tight budget
+
+    trace = load_default_trace()
+    if trace is not None:
+        sim.trace_replay = trace
+        # Start replay from a random offset to vary episodes
+        offset = rng.randint(0, max(1, len(trace) - sim.max_steps))
+        # We store offset in step_count adjustment — trace_loader wraps around
+        sim.current_request_rate = trace.get_step(offset).request_rate
+    else:
+        # Fallback: synthetic 2x traffic if trace not generated
+        sim.current_request_rate = sim.base_request_rate * 2.0
+
+    # Pre-stress the cluster slightly
+    for node in sim.nodes:
+        if node.role == "app_server":
+            node.cpu_util = 0.40 + rng.uniform(-0.05, 0.1)
+            node.queue_length = rng.randint(3, 12)
+        elif node.role == "database":
+            node.cpu_util = 0.35 + rng.uniform(-0.03, 0.05)
+            node.queue_length = rng.randint(2, 8)
+
+
+def _grade_alibaba_trace(env: "DistributedInfraEnvironment") -> float:
+    """
+    Score = Uptime (35%) + Latency (30%) + Throughput (20%) + Efficiency (15%).
+    """
+    sim = env.sim
+
+    # Uptime
+    avg_uptime = (
+        sum(sim.uptime_history) / len(sim.uptime_history) if sim.uptime_history else 0.0
+    )
+
+    # Latency: fraction of steps below 80ms (more generous for real traffic)
+    target = 80.0
+    below_target = sum(1 for lat in sim.latency_history if lat < target)
+    latency_score = (
+        below_target / len(sim.latency_history) if sim.latency_history else 0.0
+    )
+
+    # Throughput: did the agent actually serve requests?
+    throughput_ratio = sim.total_requests_served / max(1, sim.total_requests_received)
+    throughput_score = min(1.0, throughput_ratio / 0.6)  # 60% = full marks
+
+    # Efficiency: budget conservation
+    budget_used = 8 - sim.cloud_budget
+    efficiency_score = max(0.0, 1.0 - budget_used / 8)
+
+    score = (
+        0.35 * avg_uptime
+        + 0.30 * latency_score
+        + 0.20 * throughput_score
+        + 0.15 * efficiency_score
+    )
+    return round(min(0.99, max(0.01, score)), 4)
+
+
+def _is_done_alibaba_trace(env: "DistributedInfraEnvironment") -> bool:
+    sim = env.sim
+    # Terminate early if >70% of cluster dies
+    failed_count = sum(1 for n in sim.nodes if n.is_failed)
+    if failed_count > len(sim.nodes) * 0.7:
+        return True
+    return sim.step_count >= sim.max_steps
+
+
+# ============================================================================
 # Task Registry
 # ============================================================================
 
@@ -407,6 +485,20 @@ TASKS = {
             "Your objective is pure survival. You MUST aggressively use 'scale_up' "
             "to add capacity AND use 'throttle' to drop excess traffic. "
             "If you do not shed load, the cluster will collapse."
+        ),
+    },
+    # --- Level 5: Alibaba Trace Replay ---
+    "level_5_alibaba_trace": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "ALIBABA TRACE REPLAY (Level 5): You are operating on REAL production "
+            "traffic from Alibaba's microservices cluster (2021 trace data). "
+            "Traffic has multimodal spikes, micro-bursts, and silent maintenance windows. "
+            "Node 0 is the DATABASE (single point of failure). Nodes 1-7 are app servers. "
+            "New nodes have a 3-step cold start. Budget is tight (8 credits). "
+            "Read Prometheus metrics carefully — they follow production scrape format."
         ),
     },
 }
