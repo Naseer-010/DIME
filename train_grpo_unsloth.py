@@ -87,9 +87,10 @@ MAX_SEQ_LENGTH   = 2048
 LORA_RANK        = 32
 OUTPUT_DIR       = "checkpoints/qwen3_grpo_unsloth"
 
-DATASET_EPISODES = 300      # env rollouts to build the training dataset
-MAX_STEPS        = 500      # GRPOTrainer update steps
-NUM_GENERATIONS  = 4        # G — completions per prompt (Unsloth: num_generations)
+DATASET_EPISODES = 500      # env rollouts to build the training dataset
+MAX_STEPS        = 300      # GRPOTrainer update steps
+NUM_GENERATIONS  = 4        # G — completions per prompt; reward_env is CPU-bound, keep small
+MAX_COMPLETION_LENGTH = 512 # Qwen3 no-think response is ~60 tokens; 512 is a safe ceiling
 SAVE_STEPS       = 100
 
 ALL_TASKS = [
@@ -275,6 +276,7 @@ def collect_dataset(n_episodes: int, tasks: List[str]) -> Dataset:
                     {
                         "role": "user",
                         "content": (
+                            "/no_think\n"   # suppress Qwen3 <think> block — response is ~60 tokens, not ~600
                             f"Current system state:\n{json.dumps(d)}\n"
                             "Respond with the required XML and JSON format."
                         ),
@@ -549,16 +551,17 @@ def reward_triage(
 def main() -> None:
     # ---- Load model (Unsloth FastLanguageModel + LoRA + FP8) ----
     print(f"[GRPO] Loading {MODEL_NAME} ...")
-    # fast_inference=True  → loads vLLM engine (~16GB extra), faster generation
-    # fast_inference=False → standard model.generate(), saves 16GB, safe on 40GB A100
-    FAST_INFERENCE = True   # set False if running on a 40GB GPU
+    # fast_inference=True  → vLLM engine, much faster generation (~3-5x vs model.generate)
+    # compilation_config=0 → basic CUDA graphs only; skips piecewise graph-split that
+    #                        crashes on A100 SM 8.0 (vLLM bug in _decompose_size_nodes)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name       = MODEL_NAME,
-        max_seq_length   = MAX_SEQ_LENGTH,
-        load_in_4bit     = False,
-        fast_inference   = FAST_INFERENCE,
-        max_lora_rank    = LORA_RANK,
-        load_in_fp8      = True,
+        model_name          = MODEL_NAME,
+        max_seq_length      = MAX_SEQ_LENGTH,
+        load_in_4bit        = False,
+        fast_inference      = True,
+        max_lora_rank       = LORA_RANK,
+        load_in_fp8         = False,       # FP8 requires compute capability 8.9+; A100 is 8.0
+        compilation_config  = 0,           # avoid piecewise graph-split crash; still uses CUDA graphs
     )
 
     model = FastLanguageModel.get_peft_model(
@@ -614,11 +617,12 @@ def main() -> None:
         lr_scheduler_type            = "cosine",
         optim                        = "adamw_8bit",
         logging_steps                = 5,
-        per_device_train_batch_size  = 1,
+        per_device_train_batch_size  = 1,     # keep small: reward_env is CPU-bound, not GPU-bound
         gradient_accumulation_steps  = 4,     # effective batch = 4
         num_generations              = NUM_GENERATIONS,
+        vllm_gpu_memory_utilization  = 0.7,   # 70% of remaining VRAM for KV cache → faster generation
         max_prompt_length            = max_prompt_len,
-        max_completion_length        = max_comp_len,
+        max_completion_length        = MAX_COMPLETION_LENGTH,  # hard cap: prevents Qwen3 think-block bloat
         max_steps                    = MAX_STEPS,
         save_steps                   = SAVE_STEPS,
         output_dir                   = OUTPUT_DIR,
