@@ -14,20 +14,24 @@ class InfraAction(Action):
     Action the LLM agent can take to manage the distributed system.
 
     Supported action types:
-        - restart_node: Bring a failed node back online (2-step delay).
+        - restart_node: Bring a failed node back online (2-step delay, 5-step cooldown).
         - reroute_traffic: Shift a fraction of load between two nodes.
-        - scale_up: Add a temporary capacity node for 10 steps.
+        - scale_up: Add a temporary capacity node for 10 steps (costs 1 cloud budget unit).
         - throttle: Reduce incoming request acceptance rate.
+        - query_logs: Investigate a node with telemetry dropout (partial observability).
         - no_op: Take no action (passive observation step).
+
+    Optionally, ``raw_command`` can be set to a kubectl/AWS CLI string
+    which takes priority and is parsed into structured fields automatically.
     """
 
     action_type: Literal[
-        "restart_node", "reroute_traffic", "scale_up", "throttle", "no_op"
+        "restart_node", "reroute_traffic", "scale_up", "throttle", "query_logs", "no_op"
     ] = Field(description="The management action to perform.")
 
     target: Optional[int] = Field(
         default=None,
-        description="Target node index (used by restart_node).",
+        description="Target node index (used by restart_node, query_logs).",
     )
     from_node: Optional[int] = Field(
         default=None,
@@ -43,9 +47,20 @@ class InfraAction(Action):
         le=1.0,
         description="Throttle rate in [0, 1] (used by throttle). 1.0 = accept all, 0.0 = reject all.",
     )
+    raw_command: Optional[str] = Field(
+        default=None,
+        description=(
+            "Raw kubectl/AWS CLI command string. When set, the environment "
+            "parses this into a structured action automatically. Takes "
+            "priority over other fields."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_action_params(self) -> "InfraAction":
+        # Skip validation when raw_command is provided — it gets parsed later
+        if self.raw_command:
+            return self
         if self.action_type == "restart_node" and self.target is None:
             raise ValueError("restart_node requires 'target' node index.")
         if self.action_type == "reroute_traffic":
@@ -55,6 +70,8 @@ class InfraAction(Action):
                 )
         if self.action_type == "throttle" and self.rate is None:
             raise ValueError("throttle requires 'rate' parameter.")
+        if self.action_type == "query_logs" and self.target is None:
+            raise ValueError("query_logs requires 'target' node index.")
         return self
 
 
@@ -62,13 +79,19 @@ class InfraObservation(Observation):
     """
     Observation returned to the LLM agent at each step.
 
-    Contains the full observable state of the distributed system.
+    Contains the observable state of the distributed system plus
+    anti-hacking and partial-observability metadata.
     """
 
     cpu_loads: List[float] = Field(
-        description="CPU utilization [0.0, 1.0] for each node."
+        description=(
+            "CPU utilization [0.0, 1.0] for each node. "
+            "A value of -1.0 indicates telemetry dropout (timeout)."
+        )
     )
-    queue_lengths: List[int] = Field(description="Number of pending requests per node.")
+    queue_lengths: List[int] = Field(
+        description="Number of pending requests per node. -1 indicates telemetry dropout."
+    )
     failed_nodes: List[int] = Field(
         description="Indices of nodes currently in failed state."
     )
@@ -83,6 +106,25 @@ class InfraObservation(Observation):
         description="Natural language description of the current task objective."
     )
     task_score: float = Field(default=0.01, description="Current grader score")
+
+    # --- Partial observability ---
+    telemetry_status: Dict[int, str] = Field(
+        default_factory=dict,
+        description="Per-node telemetry status: 'ok' or 'timeout'.",
+    )
+
+    # --- Anti-hacking sandbox ---
+    action_errors: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Errors from the last action (e.g. InsufficientFunds, "
+            "CooldownActive, ParseError)."
+        ),
+    )
+    cloud_budget: int = Field(
+        default=10,
+        description="Remaining cloud budget units for scale_up.",
+    )
 
 
 class InfraState(State):

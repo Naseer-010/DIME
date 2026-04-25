@@ -6,7 +6,16 @@ from typing import Optional
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 
-TASK_IDS = ("traffic_spike", "node_failure", "cascading_failure")
+TASK_IDS = (
+    "traffic_spike",
+    "node_failure",
+    "cascading_failure",
+    "flash_crowd",
+    "level_1_read_logs",
+    "level_2_single_fix",
+    "level_3_stochastic",
+    "level_4_expert",
+)
 
 
 @dataclass
@@ -39,7 +48,9 @@ class EmbeddedBackendBridge:
             for node_index, neighbors in self._env.sim.adjacency.items()
         }
 
-    def reset(self, *, seed: int | None = None, task_id: str = "traffic_spike") -> BackendStep:
+    def reset(
+        self, *, seed: int | None = None, task_id: str = "traffic_spike"
+    ) -> BackendStep:
         observation = self._env.reset(seed=seed, task=task_id)
         self._last_observation = observation
         return BackendStep(

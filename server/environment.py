@@ -2,8 +2,9 @@
 Distributed Infrastructure Simulation Engine.
 
 Core simulation logic: weighted node graph, load redistribution,
-failure probability model, cascading failure triggers, and the
-dense reward function.
+failure probability model, cascading failure triggers, composable
+rubric reward system, curriculum API, partial observability,
+anti-hacking budgets/cooldowns, and real-world action schemas.
 """
 
 import random
@@ -14,6 +15,8 @@ from uuid import uuid4
 from openenv.core.env_server.interfaces import Environment
 
 from server.models import InfraAction, InfraObservation, InfraState
+from server.rubrics import compute_composite_reward
+from server.command_parser import parse_command, CommandParseError
 
 # Import tasks lazily to avoid circular imports
 _TASKS = None
@@ -69,6 +72,22 @@ class SimulationState:
     latency_history: List[float] = field(default_factory=list)
     restart_count: int = 0
     cascade_occurred: bool = False
+
+    # --- Composable rubric support ---
+    last_action_valid: bool = True
+    last_action_type: str = "no_op"
+
+    # --- Curriculum ---
+    curriculum_level: int = 1
+
+    # --- Anti-hacking sandbox ---
+    cloud_budget: int = 10  # scale_up credits
+    action_cooldowns: Dict[str, Dict[int, int]] = field(default_factory=dict)
+    # e.g. {"restart_node": {3: 4}}  → node 3 has 4 steps of cooldown left
+    action_errors: List[str] = field(default_factory=list)
+
+    # --- Partial observability ---
+    telemetry_dropout_nodes: List[int] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +169,21 @@ class DistributedInfraEnvironment(Environment):
             self._rng = random.Random()
 
         task_id = kwargs.get("task", kwargs.get("task_id", "traffic_spike"))
+        curriculum_level = int(kwargs.get("curriculum_level", 0))
+
+        # Auto-detect curriculum level from task_id if not explicitly given
+        if curriculum_level == 0:
+            _level_map = {
+                "level_1_read_logs": 1,
+                "level_2_single_fix": 2,
+                "traffic_spike": 2,
+                "node_failure": 2,
+                "level_3_stochastic": 3,
+                "cascading_failure": 3,
+                "level_4_expert": 4,
+                "flash_crowd": 4,
+            }
+            curriculum_level = _level_map.get(task_id, 2)
 
         nodes, adjacency = _build_default_graph(8)
         self._sim = SimulationState(
@@ -165,6 +199,8 @@ class DistributedInfraEnvironment(Environment):
             task_id=task_id,
             max_steps=30,
             episode_id=episode_id or str(uuid4()),
+            curriculum_level=curriculum_level,
+            cloud_budget=max(5, 15 - curriculum_level * 2),  # harder = tighter budget
         )
 
         # Apply task-specific setup
@@ -191,7 +227,10 @@ class DistributedInfraEnvironment(Environment):
         """Execute one time step in the simulation."""
         sim = self._sim
 
-        # 1. Process agent action
+        # 0. Reset per-step error list
+        sim.action_errors = []
+
+        # 1. Process agent action (handles raw_command, budgets, cooldowns)
         self._apply_action(action)
 
         # 2. Simulate request arrivals
@@ -251,7 +290,30 @@ class DistributedInfraEnvironment(Environment):
     def _apply_action(self, action: InfraAction) -> None:
         sim = self._sim
 
+        # --- Raw command parsing (real-world kubectl/AWS CLI) ---
+        if action.raw_command:
+            try:
+                action = parse_command(action.raw_command)
+                sim.last_action_valid = True
+            except CommandParseError as exc:
+                sim.action_errors.append(f"ParseError: {exc}")
+                sim.last_action_valid = False
+                sim.last_action_type = "parse_error"
+                return
+        else:
+            sim.last_action_valid = True
+
+        sim.last_action_type = action.action_type
+
         if action.action_type == "no_op":
+            return
+
+        # --- query_logs: partial-observability investigation action ---
+        if action.action_type == "query_logs":
+            idx = action.target
+            if idx is not None and idx in sim.telemetry_dropout_nodes:
+                sim.telemetry_dropout_nodes.remove(idx)
+            # Does NOT count as a management action for efficiency scoring
             return
 
         sim.actions_taken += 1
@@ -259,10 +321,23 @@ class DistributedInfraEnvironment(Environment):
         if action.action_type == "restart_node":
             idx = action.target
             if idx is not None and 0 <= idx < len(sim.nodes):
+                # --- Cooldown check ---
+                restart_cds = sim.action_cooldowns.get("restart_node", {})
+                if restart_cds.get(idx, 0) > 0:
+                    sim.action_errors.append(
+                        f"CooldownActive: restart_node on node {idx} "
+                        f"has {restart_cds[idx]} steps remaining."
+                    )
+                    return
+
                 node = sim.nodes[idx]
                 if node.is_failed and node.restart_countdown == 0:
                     node.restart_countdown = 2  # 2-step delay
                     sim.restart_count += 1
+                    # Set 5-step cooldown
+                    if "restart_node" not in sim.action_cooldowns:
+                        sim.action_cooldowns["restart_node"] = {}
+                    sim.action_cooldowns["restart_node"][idx] = 5
 
         elif action.action_type == "reroute_traffic":
             src = action.from_node
@@ -291,7 +366,6 @@ class DistributedInfraEnvironment(Environment):
                     not sim.cascade_bonus_awarded
                     and sim.nodes[dst].cpu_util < CASCADE_AWARENESS_THRESHOLD
                 ):
-                    # Agent is proactively redistributing before cascade
                     for neighbor_idx in sim.adjacency.get(src, []):
                         if (
                             not sim.nodes[neighbor_idx].is_failed
@@ -302,6 +376,14 @@ class DistributedInfraEnvironment(Environment):
                             break
 
         elif action.action_type == "scale_up":
+            # --- Budget check ---
+            if sim.cloud_budget <= 0:
+                sim.action_errors.append(
+                    "InsufficientFunds: cloud budget exhausted, cannot scale up."
+                )
+                return
+            sim.cloud_budget -= 1
+
             # Add temporary capacity node
             new_idx = len(sim.nodes)
             new_node = Node(
@@ -351,7 +433,7 @@ class DistributedInfraEnvironment(Environment):
             node.queue_length += added
 
     def _tick_node_timers(self) -> None:
-        """Update restart countdowns and temporary node TTLs."""
+        """Update restart countdowns, temporary node TTLs, and action cooldowns."""
         sim = self._sim
         expired_temps = []
 
@@ -371,6 +453,19 @@ class DistributedInfraEnvironment(Environment):
                 node.ttl -= 1
                 if node.ttl <= 0:
                     expired_temps.append(i)
+
+        # --- Tick action cooldowns ---
+        for action_type in list(sim.action_cooldowns.keys()):
+            cds = sim.action_cooldowns[action_type]
+            expired_keys = []
+            for node_idx in cds:
+                cds[node_idx] -= 1
+                if cds[node_idx] <= 0:
+                    expired_keys.append(node_idx)
+            for k in expired_keys:
+                del cds[k]
+            if not cds:
+                del sim.action_cooldowns[action_type]
 
         # Remove expired temporary nodes (in reverse to preserve indices)
         for idx in reversed(expired_temps):
@@ -502,55 +597,34 @@ class DistributedInfraEnvironment(Environment):
         node.cpu_util = 0.0
         node.queue_length = 0
 
-    # ----- Reward computation -----
+    # ----- Reward computation (composable rubrics) -----
 
     def _compute_reward(self) -> float:
         """
-        Dense step-level reward signal:
+        Dense step-level reward using independent, composable verifiers.
 
-        R(t) = 0.40 * uptime_ratio
-             - 0.30 * normalized_latency
-             - 0.20 * overload_fraction
-             - 0.10 * (actions_taken / max_steps)
-             + 0.50 * cascade_prevented_bonus
+        Each verifier scores one aspect:
+          - FormatVerifier:     +0.1  for a valid action
+          - StabilityVerifier:  +0.4  for 100% uptime
+          - SLAVerifier:        +0.3  for P99 latency < 50ms
+          - EfficiencyVerifier: -0.2  penalty for wasteful scale_up
+
+        The breakdown is stored in ``_last_rubric_breakdown`` for
+        inclusion in the observation metadata.
         """
         sim = self._sim
-        total = len(sim.nodes)
-        if total == 0:
+        if not sim.nodes:
+            self._last_rubric_breakdown = {}
             return 0.0
 
-        alive = sum(1 for n in sim.nodes if not n.is_failed)
-        uptime_ratio = alive / total
-
-        normalized_latency = min(2.0, sim.latency_ms / TARGET_LATENCY_MS)
-
-        overloaded = sum(
-            1 for n in sim.nodes if not n.is_failed and n.cpu_util > OVERLOAD_THRESHOLD
-        )
-        overload_fraction = overloaded / total
-
-        action_penalty = sim.actions_taken / max(1, sim.max_steps)
-
-        cascade_bonus = 0.5 if sim.cascade_bonus_awarded else 0.0
-
-        reward = (
-            0.40 * uptime_ratio
-            - 0.30 * normalized_latency
-            - 0.20 * overload_fraction
-            - 0.10 * action_penalty
-            + cascade_bonus
-        )
-
-        # Reset one-time bonus so it's not double-counted
-        if sim.cascade_bonus_awarded:
-            sim.cascade_bonus_awarded = False
-
-        return round(reward, 4)
+        reward, breakdown = compute_composite_reward(sim)
+        self._last_rubric_breakdown = breakdown
+        return reward
 
     # ----- Observation builder -----
 
     def _make_observation(self) -> InfraObservation:
-        """Build the current observation for the agent."""
+        """Build the current observation for the agent (with partial observability)."""
         sim = self._sim
         tasks = _get_tasks()
 
@@ -558,9 +632,34 @@ class DistributedInfraEnvironment(Environment):
         if sim.task_id in tasks:
             task_hint = tasks[sim.task_id].get("hint", "")
 
+        # --- Partial observability: 5% telemetry dropout per node ---
+        cpu_loads = []
+        queue_lengths = []
+        telemetry_status: Dict[int, str] = {}
+
+        # Decide new dropouts for this step (keep previously dropped if not queried)
+        new_dropouts: List[int] = []
+        for i, node in enumerate(sim.nodes):
+            if i in sim.telemetry_dropout_nodes:
+                # Still dropped out
+                new_dropouts.append(i)
+            elif self._rng.random() < 0.05:
+                new_dropouts.append(i)
+        sim.telemetry_dropout_nodes = new_dropouts
+
+        for i, node in enumerate(sim.nodes):
+            if i in sim.telemetry_dropout_nodes:
+                cpu_loads.append(-1.0)  # sentinel: data unavailable
+                queue_lengths.append(-1)
+                telemetry_status[i] = "timeout"
+            else:
+                cpu_loads.append(round(node.cpu_util, 3))
+                queue_lengths.append(node.queue_length)
+                telemetry_status[i] = "ok"
+
         return InfraObservation(
-            cpu_loads=[round(n.cpu_util, 3) for n in sim.nodes],
-            queue_lengths=[n.queue_length for n in sim.nodes],
+            cpu_loads=cpu_loads,
+            queue_lengths=queue_lengths,
             failed_nodes=[i for i, n in enumerate(sim.nodes) if n.is_failed],
             latency_ms=round(sim.latency_ms, 2),
             request_rate=round(sim.current_request_rate * sim.throttle_rate, 2),
@@ -568,4 +667,7 @@ class DistributedInfraEnvironment(Environment):
             task_hint=task_hint,
             done=False,
             reward=0.0,
+            telemetry_status=telemetry_status,
+            action_errors=list(sim.action_errors),
+            cloud_budget=sim.cloud_budget,
         )
