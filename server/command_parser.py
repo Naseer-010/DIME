@@ -161,10 +161,23 @@ def parse_command(raw: str) -> InfraAction:
                     "or a valid InfraAction object."
                 ) from exc
 
+    # --- Graceful normalization: strip hallucinated 'node-' prefixes ---
+    # LLMs frequently write --from=node-5 instead of --from=5.
+    # Also handles Node-, NODE-, node_, etc.
+    clean_raw = re.sub(r"(?i)\bnode[-_](\d+)", r"\1", raw)
+
     for pattern, handler in _PATTERNS:
-        m = pattern.search(raw)
+        m = pattern.search(clean_raw)
         if m:
             return handler(m)
+
+    # Fallback: try original raw in case normalization broke something
+    if clean_raw != raw:
+        for pattern, handler in _PATTERNS:
+            m = pattern.search(raw)
+            if m:
+                return handler(m)
+
     raise CommandParseError(
         f"Unrecognised command: '{raw[:120]}'. "
         "Expected kubectl or AWS CLI syntax. Examples:\n"
