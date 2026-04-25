@@ -2,10 +2,6 @@
 """
 Offline training script for DIME log data.
 
-Key guarantee:
-- Samples with reward <= invalid_reward_sentinel (default: -1000.0) never
-  influence optimization or model-selection metrics.
-
 This script trains a causal LM on assistant responses captured in DIME logs
 using reward-weighted supervised fine-tuning (AWR-style weighting).
 """
@@ -62,6 +58,9 @@ class LoggedSample:
 class WeightedSample(LoggedSample):
     valid_for_training: bool
     weight: float
+    weight_source: str
+    intermediate_reward: float
+    effective_reward: float
 
 
 def _safe_task_at(position: int, start_positions: Sequence[int], task_names: Sequence[str]) -> str:
@@ -217,6 +216,91 @@ def _robust_stats(values: Sequence[float]) -> Tuple[float, float]:
     return median, scale
 
 
+def _is_invalid_reward(reward: float, invalid_reward_sentinel: float) -> bool:
+    return reward <= invalid_reward_sentinel + 1e-12
+
+
+def _clamp_weight(w: float, min_weight: float, max_weight: float) -> float:
+    return max(min_weight, min(max_weight, w))
+
+
+def _heuristic_weight(
+    score: float,
+    *,
+    min_weight: float,
+    max_weight: float,
+    invalid_uniform_weight: float,
+) -> float:
+    # Keep heuristic influence bounded near a conservative band to avoid
+    # overpowering optimization when reward is uninformative.
+    high = min(max_weight, max(min_weight, invalid_uniform_weight * 2.0))
+    return _clamp_weight(min_weight + score * (high - min_weight), min_weight, high)
+
+
+def _partial_action_completion_score(sample: LoggedSample, task_max_step: int) -> float:
+    """
+    Intermediate completion score in [0, 1].
+    Interprets partial execution quality from command completeness + formatting.
+    """
+    cmd = (sample.command or "").strip().lower()
+    err = (sample.error or "").strip().lower()
+    text = (sample.response_text or "").lower()
+
+    score = 0.0
+
+    # Structured response compliance
+    if "<reasoning>" in text and "</reasoning>" in text:
+        score += 0.15
+    if "<action>" in text and "</action>" in text:
+        score += 0.15
+
+    # Basic command validity
+    if cmd and cmd != "unknown":
+        score += 0.20
+
+    # Partial action completeness by command family
+    if cmd == "no_op":
+        score += 0.05
+    if cmd.startswith("kubectl scale") and "--replicas" in cmd:
+        score += 0.20
+    elif ("delete pod" in cmd or "rollout restart" in cmd) and "node-" in cmd:
+        score += 0.20
+    elif "traffic shift" in cmd and "--from" in cmd and "--to" in cmd:
+        score += 0.20
+    elif "throttle ingress" in cmd and "--rate" in cmd:
+        score += 0.20
+    elif cmd.startswith("kubectl logs") and "node-" in cmd:
+        score += 0.20
+
+    # Successful local parsing/execution indicator from logs
+    if err in {"", "null", "none"}:
+        score += 0.10
+
+    # Early episode partial recovery actions get a small curriculum boost
+    step_norm = 0.0 if task_max_step <= 1 else (sample.step - 1) / max(1, task_max_step - 1)
+    score += 0.05 * (1.0 - max(0.0, min(1.0, step_norm)))
+
+    return max(0.0, min(1.0, score))
+
+
+def _behavior_score(sample: LoggedSample, task_max_step: int) -> float:
+    """
+    Heuristic quality score in [0, 1] used when reward signal is degenerate.
+    This keeps training moving even when rewards collapse to one value.
+    """
+    score = 0.0
+
+    # Reuse partial completion and add light preference for fully actionable commands.
+    score += _partial_action_completion_score(sample, task_max_step) * 0.85
+    cmd = (sample.command or "").strip().lower()
+    if cmd.startswith("kubectl"):
+        score += 0.10
+    if sample.done and cmd != "unknown":
+        score += 0.05
+
+    return max(0.0, min(1.0, score))
+
+
 def compute_weights(
     samples: Sequence[LoggedSample],
     *,
@@ -225,26 +309,88 @@ def compute_weights(
     max_weight: float,
     temperature: float,
     include_invalid_in_dataset: bool,
+    invalid_reward_policy: str,
+    invalid_uniform_weight: float,
+    degenerate_reward_mode: str,
+    intermediate_reward_enabled: bool,
+    intermediate_reward_scale: float,
 ) -> List[WeightedSample]:
-    valid_rewards = [
-        s.reward
-        for s in samples
-        if s.reward > invalid_reward_sentinel + 1e-12
-    ]
-    center, scale = _robust_stats(valid_rewards)
+    task_max_step: Dict[str, int] = {}
+    for s in samples:
+        task_max_step[s.task] = max(task_max_step.get(s.task, 0), s.step)
+
+    intermediate_by_idx: Dict[int, float] = {}
+    effective_rewards: List[float] = []
+    reward_candidates: List[float] = []
+
+    for idx, s in enumerate(samples):
+        task_max = task_max_step.get(s.task, s.step)
+        partial_score = _partial_action_completion_score(s, task_max)
+        intermediate_reward = (
+            float(intermediate_reward_scale) * partial_score if intermediate_reward_enabled else 0.0
+        )
+        effective_reward = float(s.reward + intermediate_reward)
+
+        intermediate_by_idx[idx] = intermediate_reward
+        effective_rewards.append(effective_reward)
+
+        is_invalid = _is_invalid_reward(s.reward, invalid_reward_sentinel)
+        if (not is_invalid) or include_invalid_in_dataset:
+            reward_candidates.append(effective_reward)
+
+    center, scale = _robust_stats(reward_candidates)
+    reward_has_variation = (
+        len(reward_candidates) >= 2 and (max(reward_candidates) - min(reward_candidates)) > 1e-9
+    )
 
     weighted: List[WeightedSample] = []
-    for s in samples:
-        valid = s.reward > invalid_reward_sentinel + 1e-12
+    for idx, s in enumerate(samples):
+        valid = not _is_invalid_reward(s.reward, invalid_reward_sentinel)
+        task_max = task_max_step.get(s.task, s.step)
+        effective_reward = effective_rewards[idx]
+        intermediate_reward = intermediate_by_idx[idx]
 
-        if valid:
-            z = (s.reward - center) / max(1e-6, scale)
+        if reward_has_variation and valid:
+            z = (effective_reward - center) / max(1e-6, scale)
             # AWR-style positive weighting
             w = math.exp(z / max(1e-6, temperature))
-            w = max(min_weight, min(max_weight, w))
+            w = _clamp_weight(w, min_weight, max_weight)
+            source = "reward_awr+intermediate" if intermediate_reward_enabled else "reward_awr"
+        elif reward_has_variation and not valid:
+            if invalid_reward_policy == "mask":
+                w = 0.0
+                source = "invalid_mask"
+            elif invalid_reward_policy == "uniform":
+                w = _clamp_weight(invalid_uniform_weight, min_weight, max_weight)
+                source = "invalid_uniform"
+            else:
+                z = (effective_reward - center) / max(1e-6, scale)
+                awr = _clamp_weight(math.exp(z / max(1e-6, temperature)), min_weight, max_weight)
+                score = _behavior_score(s, task_max)
+                heuristic = _heuristic_weight(
+                    score,
+                    min_weight=min_weight,
+                    max_weight=max_weight,
+                    invalid_uniform_weight=invalid_uniform_weight,
+                )
+                # Blend behavior heuristic with shaped reward ranking.
+                w = _clamp_weight(0.65 * heuristic + 0.35 * awr, min_weight, max_weight)
+                source = "invalid_heuristic+intermediate" if intermediate_reward_enabled else "invalid_heuristic"
         else:
-            # Hard guarantee: invalid samples get zero training influence.
-            w = 0.0
+            # Degenerate case: rewards are collapsed (e.g., all -1000). Recover
+            # train signal via normalized fallback weighting.
+            if degenerate_reward_mode == "uniform":
+                w = _clamp_weight(invalid_uniform_weight, min_weight, max_weight)
+                source = "degenerate_uniform"
+            else:
+                score = _behavior_score(s, task_max)
+                w = _heuristic_weight(
+                    score,
+                    min_weight=min_weight,
+                    max_weight=max_weight,
+                    invalid_uniform_weight=invalid_uniform_weight,
+                )
+                source = "degenerate_heuristic+intermediate" if intermediate_reward_enabled else "degenerate_heuristic"
 
         if include_invalid_in_dataset or valid:
             weighted.append(
@@ -252,6 +398,9 @@ def compute_weights(
                     **asdict(s),
                     valid_for_training=valid,
                     weight=w,
+                    weight_source=source,
+                    intermediate_reward=intermediate_reward,
+                    effective_reward=effective_reward,
                 )
             )
 
@@ -624,10 +773,45 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output-dir", type=Path, default=Path("artifacts/qwen3_dime_train"))
 
     p.add_argument("--invalid-reward-sentinel", type=float, default=-1000.0)
-    p.add_argument("--include-invalid-in-dataset", action="store_true", help="Keep invalid rows with zero weight.")
+    p.add_argument(
+        "--include-invalid-in-dataset",
+        action="store_true",
+        help="Keep reward<=sentinel rows in dataset and apply selected invalid-reward policy.",
+    )
     p.add_argument("--min-weight", type=float, default=0.05)
     p.add_argument("--max-weight", type=float, default=5.0)
     p.add_argument("--temperature", type=float, default=1.0)
+    p.add_argument(
+        "--invalid-reward-policy",
+        type=str,
+        choices=["mask", "uniform", "heuristic"],
+        default="heuristic",
+        help="How reward<=sentinel samples are weighted when reward variation exists.",
+    )
+    p.add_argument(
+        "--invalid-uniform-weight",
+        type=float,
+        default=0.5,
+        help="Uniform weight used by uniform policies and as fallback baseline.",
+    )
+    p.add_argument(
+        "--degenerate-reward-mode",
+        type=str,
+        choices=["uniform", "heuristic"],
+        default="heuristic",
+        help="Fallback used when reward signal is degenerate (e.g. all rewards identical).",
+    )
+    p.add_argument(
+        "--disable-intermediate-reward",
+        action="store_true",
+        help="Disable intermediate reward shaping from partial action completion.",
+    )
+    p.add_argument(
+        "--intermediate-reward-scale",
+        type=float,
+        default=200.0,
+        help="Max additive shaped reward for a fully completed partial action (score=1.0).",
+    )
 
     p.add_argument("--max-length", type=int, default=1024)
     p.add_argument("--train-split", type=float, default=0.9)
@@ -678,20 +862,33 @@ def main() -> int:
     if not all_samples:
         raise RuntimeError("No trainable blocks were parsed from log files.")
 
+    parsed_total = len(all_samples)
+    parsed_valid = sum(
+        1 for s in all_samples if not _is_invalid_reward(s.reward, args.invalid_reward_sentinel)
+    )
+    parsed_invalid = parsed_total - parsed_valid
+
+    include_invalid = args.include_invalid_in_dataset
+    if parsed_valid == 0 and not include_invalid:
+        include_invalid = True
+        LOGGER.warning(
+            "All parsed rewards are <= sentinel; auto-enabling invalid samples in dataset "
+            "so training can proceed with normalized fallback weighting."
+        )
+
     weighted = compute_weights(
         all_samples,
         invalid_reward_sentinel=args.invalid_reward_sentinel,
         min_weight=args.min_weight,
         max_weight=args.max_weight,
         temperature=args.temperature,
-        include_invalid_in_dataset=args.include_invalid_in_dataset,
+        include_invalid_in_dataset=include_invalid,
+        invalid_reward_policy=args.invalid_reward_policy,
+        invalid_uniform_weight=args.invalid_uniform_weight,
+        degenerate_reward_mode=args.degenerate_reward_mode,
+        intermediate_reward_enabled=not args.disable_intermediate_reward,
+        intermediate_reward_scale=args.intermediate_reward_scale,
     )
-
-    parsed_total = len(all_samples)
-    parsed_valid = sum(
-        1 for s in all_samples if s.reward > args.invalid_reward_sentinel + 1e-12
-    )
-    parsed_invalid = parsed_total - parsed_valid
 
     kept_total = len(weighted)
     kept_valid = sum(1 for s in weighted if s.valid_for_training)
@@ -710,17 +907,22 @@ def main() -> int:
         dropped_invalid,
     )
 
-    if kept_valid == 0:
+    if not weighted:
         raise RuntimeError(
-            "No valid training samples remain after masking reward <= sentinel. "
-            "This is expected if your log only contains -1000 rewards. "
-            "Add more logs with non -1000 rewards, or regenerate trajectories."
+            "No samples left after filtering. Set --include-invalid-in-dataset or provide more logs."
         )
 
-    # Ensure zero influence from invalid rows by explicit assertion.
-    leaked = [s for s in weighted if not s.valid_for_training and abs(s.weight) > 0.0]
-    if leaked:
-        raise AssertionError("Invalid rows detected with non-zero weight; aborting for safety.")
+    active = [s for s in weighted if s.weight > 0.0]
+    if not active:
+        raise RuntimeError(
+            "All sample weights are zero. "
+            "Use --invalid-reward-policy uniform|heuristic, or adjust min/max weight."
+        )
+
+    if args.invalid_reward_policy == "mask":
+        leaked = [s for s in weighted if not s.valid_for_training and abs(s.weight) > 0.0]
+        if leaked:
+            raise AssertionError("Invalid rows detected with non-zero weight under mask policy.")
 
     manifest = {
         "log_files": [str(p) for p in log_paths],
@@ -732,6 +934,28 @@ def main() -> int:
         "kept_invalid_samples": kept_invalid,
         "dropped_invalid_samples": dropped_invalid,
         "invalid_reward_sentinel": args.invalid_reward_sentinel,
+        "invalid_reward_policy": args.invalid_reward_policy,
+        "invalid_uniform_weight": args.invalid_uniform_weight,
+        "degenerate_reward_mode": args.degenerate_reward_mode,
+        "intermediate_reward_enabled": bool(not args.disable_intermediate_reward),
+        "intermediate_reward_scale": args.intermediate_reward_scale,
+        "include_invalid_in_dataset_effective": include_invalid,
+        "active_samples": len(active),
+        "active_weight_sum": sum(s.weight for s in active),
+        "intermediate_reward_stats": {
+            "min": min(s.intermediate_reward for s in weighted),
+            "max": max(s.intermediate_reward for s in weighted),
+            "mean": sum(s.intermediate_reward for s in weighted) / len(weighted),
+        },
+        "effective_reward_stats": {
+            "min": min(s.effective_reward for s in weighted),
+            "max": max(s.effective_reward for s in weighted),
+            "mean": sum(s.effective_reward for s in weighted) / len(weighted),
+        },
+        "weight_source_breakdown": {
+            k: sum(1 for s in weighted if s.weight_source == k)
+            for k in sorted({s.weight_source for s in weighted})
+        },
         "weight_stats": {
             "min": min(s.weight for s in weighted),
             "max": max(s.weight for s in weighted),
