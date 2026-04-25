@@ -43,20 +43,25 @@ class Verifier(Protocol):
 
 
 @dataclass
-class FormatVerifier:
+class CoTFormatVerifier:
     """
-    +1.0 for outputting a syntactically correct response/action format.
+    +0.05 for outputting a syntactically correct response/action format.
+    -0.5 penalty for unparseable actions.
 
-    ``last_response_format_valid`` is set by the environment. For structured
-    actions this means valid JSON reached the server; for raw commands it means
-    the parser found the required <reasoning> XML block and JSON command body.
+    Scaled down to prevent loss imbalance (the agent shouldn't get high scores
+    just for talking correctly while the cluster burns).
     """
 
     name: str = "format"
-    weight: float = 1.0
+    weight: float = 0.05
+    penalty: float = -0.5
 
     def score(self, sim: "SimulationState") -> float:
-        return self.weight if sim.last_response_format_valid else 0.0
+        # Assuming the environment sets sim.last_action_valid or sim.last_response_format_valid
+        is_valid = getattr(
+            sim, "last_response_format_valid", getattr(sim, "last_action_valid", False)
+        )
+        return self.weight if is_valid else self.penalty
 
 
 @dataclass
@@ -80,40 +85,42 @@ class StabilityVerifier:
 @dataclass
 class SafeSliceLatencyVerifier:
     """
-    Smooth bounded sigmoid latency penalty.
+    Bounded sigmoid penalty for latency to prevent vanishing gradients.
 
     Keeps the SLA threshold informative without the zero-gradient cliff from a
-    binary pass/fail reward.
+    binary pass/fail reward. Multiplied by latency to heavily punish saturation.
     """
 
     name: str = "latency"
-    alpha: float = 0.001
-    beta: float = 0.3
+    alpha: float = 0.01
+    beta: float = 5.0
     gamma: float = 0.1
-    tau: float = 50.0
+    sla_latency: float = 50.0
 
     def score(self, sim: "SimulationState") -> float:
         lat = sim.latency_ms
-        x = max(-60.0, min(60.0, self.gamma * (lat - self.tau)))
-        sigmoid = 1.0 / (1.0 + math.exp(-x))
-        return -(self.alpha * lat) - (self.beta * sigmoid)
+        # Clipped to prevent math.exp overflow
+        x = max(-10.0, min(10.0, self.gamma * (lat - self.sla_latency)))
+        sig = 1.0 / (1.0 + math.exp(-x))
+        return -(self.alpha * lat) - (self.beta * lat * sig)
 
 
 @dataclass
 class CascadePBRSVerifier:
     """
-    Potential-Based Reward Shaping for cluster stress.
+    Potential-Based Reward Shaping for cluster stress with Velocity penalty.
 
     Rewards reduction in overload stress between consecutive states while
-    preserving the optimal policy under Ng et al.'s PBRS formulation.
+    penalizing rapid load oscillation (velocity) to stop "loop-and-farm" exploits.
     """
 
     name: str = "cascade_pbrs"
-    beta_stress: float = 1.0
     tau_stress: float = 0.85
+    beta_stress: float = 10.0
     gamma: float = 0.99
+    lambda_velocity: float = 2.0
 
-    def _phi(self, nodes: List["Node"]) -> float:
+    def _potential(self, nodes: List["Node"]) -> float:
         stress = sum(
             max(0.0, n.cpu_util - self.tau_stress) ** 2
             for n in nodes
@@ -122,42 +129,64 @@ class CascadePBRSVerifier:
         return -self.beta_stress * stress
 
     def score(self, sim: "SimulationState") -> float:
-        if not sim.previous_nodes:
+        current_potential = self._potential(sim.nodes)
+
+        # If no previous load data, initialize and return 0
+        if not getattr(sim, "prev_node_loads", None):
+            sim.prev_potential = current_potential
             return 0.0
-        phi_current = self._phi(sim.nodes)
-        phi_prev = self._phi(sim.previous_nodes)
-        return (self.gamma * phi_current) - phi_prev
+
+        current_loads = [n.cpu_util for n in sim.nodes]
+        # Calculate load velocity (squared difference)
+        velocity = sum(
+            (cur - prev) ** 2
+            for cur, prev in zip(
+                current_loads, sim.prev_node_loads[: len(current_loads)]
+            )
+        )
+
+        prev_pot = getattr(sim, "prev_potential", current_potential)
+        reward = (
+            (self.gamma * current_potential)
+            - prev_pot
+            - (self.lambda_velocity * velocity)
+        )
+
+        # Set current potential for the next step calculation
+        sim.prev_potential = current_potential
+        return reward
 
 
 @dataclass
 class EconomicEfficiencyVerifier:
     """
-    Linear active-node cost plus L1 churn penalty.
-
-    Penalizes cloud footprint every step and discourages flapping capacity up
-    and down across consecutive transitions.
+    Couples w_cost with latency so lazy policies get punished, plus L1 churn penalty.
     """
 
     name: str = "efficiency"
-    w_cost: float = 0.1
+    w_cost: float = 1.0
     w_churn: float = 0.2
-    n_max: float = 20.0
+    kappa_lat: float = 0.5
+    sla_latency: float = 50.0
 
     def score(self, sim: "SimulationState") -> float:
-        n_active = sum(1 for n in sim.nodes if not n.is_failed)
-        prev_active = sim.previous_active_nodes
-        if prev_active is None:
-            prev_active = n_active
+        active_nodes = sum(1 for n in sim.nodes if not n.is_failed)
+        total_nodes = max(len(sim.nodes), 1)
 
-        delta_n = abs(n_active - prev_active)
-        cost_penalty = self.w_cost * (n_active / self.n_max)
-        churn_penalty = self.w_churn * (delta_n / self.n_max)
-        return -(cost_penalty + churn_penalty)
+        node_ratio = active_nodes / total_nodes
 
+        prev_active = getattr(sim, "prev_active_nodes", active_nodes)
+        churn_ratio = abs(active_nodes - prev_active) / total_nodes
 
-# Backward-compatible import names for code that referenced the old verifiers.
-SLAVerifier = SafeSliceLatencyVerifier
-EfficiencyVerifier = EconomicEfficiencyVerifier
+        # High latency makes nodes "cost" more, forcing the agent to solve the latency
+        # issue rather than just blindly saving money.
+        lat_penalty_multiplier = 1.0 + self.kappa_lat * (
+            sim.latency_ms / self.sla_latency
+        )
+
+        return -(self.w_cost * node_ratio * lat_penalty_multiplier) - (
+            self.w_churn * churn_ratio
+        )
 
 
 @dataclass
@@ -175,9 +204,14 @@ class ThroughputVerifier:
     min_throughput_ratio: float = 0.30  # must serve ≥30% of traffic
 
     def score(self, sim: "SimulationState") -> float:
-        if sim.throttle_rate < self.min_throughput_ratio:
+        if getattr(sim, "throttle_rate", 1.0) < self.min_throughput_ratio:
             return self.penalty
         return 0.0
+
+
+# Backward-compatible import names for code that referenced the old verifiers.
+SLAVerifier = SafeSliceLatencyVerifier
+EfficiencyVerifier = EconomicEfficiencyVerifier
 
 
 # ---------------------------------------------------------------------------
@@ -185,7 +219,7 @@ class ThroughputVerifier:
 # ---------------------------------------------------------------------------
 
 DEFAULT_RUBRICS: List[Verifier] = [
-    FormatVerifier(),
+    CoTFormatVerifier(),
     StabilityVerifier(),
     SafeSliceLatencyVerifier(),
     CascadePBRSVerifier(),
@@ -211,8 +245,13 @@ def compute_composite_reward(
     rubrics = rubrics or DEFAULT_RUBRICS
     breakdown: Dict[str, float] = {}
     total = 0.0
+
     for v in rubrics:
         s = v.score(sim)
         breakdown[v.name] = round(s, 4)
         total += s
-    return round(total, 4), breakdown
+
+    # Clip the final sum to [-10, 10] to stabilize RL gradients
+    total_clipped = max(-10.0, min(10.0, total))
+
+    return round(total_clipped, 4), breakdown

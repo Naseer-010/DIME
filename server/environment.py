@@ -106,6 +106,11 @@ class SimulationState:
     total_requests_received: int = 0
     total_requests_served: int = 0
 
+    # --- Advanced RL State Tracking ---
+    prev_node_loads: List[float] = field(default_factory=list)
+    prev_active_nodes: int = 8
+    prev_potential: float = 0.0
+
 
 # ---------------------------------------------------------------------------
 # Default graph topology: 8 nodes in a mesh-like structure
@@ -318,6 +323,11 @@ class DistributedInfraEnvironment(Environment):
         obs.reward = reward
         obs.done = done
         obs.task_score = task_score
+
+        sim.prev_node_loads = [n.cpu_util for n in sim.nodes]
+        sim.prev_active_nodes = sum(1 for n in sim.nodes if not n.is_failed)
+
+        return obs
 
         return obs
 
