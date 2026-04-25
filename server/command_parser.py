@@ -8,6 +8,7 @@ models on production-grade syntax rather than abstract JSON schemas.
 
 from __future__ import annotations
 
+import json
 import re
 
 from server.models import InfraAction
@@ -22,6 +23,10 @@ class CommandParseError(Exception):
 # ---------------------------------------------------------------------------
 
 _PATTERNS: list[tuple[re.Pattern, callable]] = []
+_REASONING_JSON_RE = re.compile(
+    r"^\s*<reasoning>.+?</reasoning>\s*(\{.*\})\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 def _register(pattern: str):
@@ -96,6 +101,28 @@ def _handle_noop(match: re.Match) -> InfraAction:
     return InfraAction(action_type="no_op")
 
 
+def _extract_reasoning_json(raw: str) -> dict | None:
+    """Return the JSON body after a <reasoning> block, if present and valid."""
+    match = _REASONING_JSON_RE.match(raw)
+    if not match:
+        return None
+    try:
+        payload = json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise CommandParseError(f"Invalid JSON after <reasoning>: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise CommandParseError("JSON command body must be an object.")
+    return payload
+
+
+def has_reasoning_json_format(raw: str) -> bool:
+    """Whether raw output uses the required <reasoning> XML + valid JSON shape."""
+    try:
+        return _extract_reasoning_json(raw.strip()) is not None
+    except CommandParseError:
+        return False
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -105,7 +132,14 @@ def parse_command(raw: str) -> InfraAction:
     """
     Parse a raw CLI command string into an ``InfraAction``.
 
-    Iterates through registered patterns; first match wins.
+    Accepts the legacy plain kubectl/AWS command format, and also the CoT
+    format:
+
+        <reasoning>...</reasoning>
+        {"command": "kubectl ..."}
+
+    The JSON body may use ``command``/``raw_command`` for CLI syntax or a full
+    structured ``InfraAction`` object.
 
     Raises
     ------
@@ -113,6 +147,20 @@ def parse_command(raw: str) -> InfraAction:
         If no pattern matches the input string.
     """
     raw = raw.strip()
+    payload = _extract_reasoning_json(raw)
+    if payload is not None:
+        command = payload.get("command", payload.get("raw_command"))
+        if isinstance(command, str):
+            raw = command.strip()
+        else:
+            try:
+                return InfraAction.model_validate(payload)
+            except Exception as exc:
+                raise CommandParseError(
+                    "JSON body must contain a string 'command'/'raw_command' "
+                    "or a valid InfraAction object."
+                ) from exc
+
     for pattern, handler in _PATTERNS:
         m = pattern.search(raw)
         if m:
