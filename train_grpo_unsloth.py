@@ -62,6 +62,21 @@ from trl import GRPOConfig as TRLGRPOConfig, GRPOTrainer  # noqa: E402
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 from server.command_parser import parse_command, CommandParseError
+from server.rubrics import calculate_step_reward as _calculate_step_reward
+
+def _probe_rubrics() -> bool:
+    """Return True if rubrics returns bounded rewards (main branch), False if -1000 (nithish)."""
+    try:
+        env = DistributedInfraEnvironment()
+        env.reset(task="traffic_spike")
+        env.sim.nodes[0].is_failed = True
+        r = _calculate_step_reward(env.sim)
+        return r > -100  # main branch returns -5.0; nithish returns -1000.0
+    except Exception:
+        return False
+
+_RUBRICS_BOUNDED = _probe_rubrics()
+print(f"[GRPO] rubrics version: {'main (bounded [-5,+5])' if _RUBRICS_BOUNDED else 'nithish (WARNING: -1000 cliff — using fallback)'}")
 
 # ---------------------------------------------------------------------------
 # Config
@@ -414,17 +429,18 @@ def reward_env(
     **kwargs,
 ) -> List[float]:
     """
-    Environment simulation reward — the core signal that replaces -1000.
+    Environment simulation reward using the production-grade SRE reward function.
 
-    For each completion:
-      1. Reconstruct env state from obs_json (approximate but sufficient)
-      2. Execute the parsed action
-      3. Measure three components:
-           uptime  = +0.5 × alive_fraction
-           latency = −0.5 × clamp((lat−50)/100)²
-           db_fail = −2.0 if node-0 is failed
+    Uses calculate_step_reward() from server/rubrics.py (friend's improved version):
+      - 7 components: uptime, DB CPU, memory cliff, p99 latency, load shedding,
+        action efficiency, temporal friction
+      - Bounded to [-5.0, +5.0] — no -1000 cliff, gradients always flow
+      - Action-aware: penalises unnecessary throttling and no-ops under load
 
-    Range: [−2.5, +0.5]
+    Requires the updated rubrics.py (main branch) where calculate_step_reward
+    returns -5.0 for DB failure instead of -1000.
+
+    Range: [−5.0, +5.0]
     """
     scores = []
     for i, comp in enumerate(completions):
@@ -432,7 +448,7 @@ def reward_env(
             obs_data  = json.loads(obs_json[i]) if obs_json else {}
             task_name = task[i] if task else "traffic_spike"
         except (TypeError, IndexError, json.JSONDecodeError):
-            scores.append(-2.5)
+            scores.append(-5.0)
             continue
 
         env = DistributedInfraEnvironment()
@@ -453,13 +469,18 @@ def reward_env(
         except Exception:
             pass
 
-        sim   = env.sim
-        nodes = sim.nodes
-        alive = sum(1 for n in nodes if not n.is_failed)
-        r_up  = 0.5 * (alive / max(len(nodes), 1))
-        r_lat = -0.5 * min((max(0.0, sim.latency_ms - 50.0) / 100.0) ** 2, 1.0)
-        r_db  = -2.0 if (nodes and nodes[0].is_failed) else 0.0
-        scores.append(r_up + r_lat + r_db)
+        if _RUBRICS_BOUNDED:
+            # Main branch: full 7-component bounded reward [-5.0, +5.0]
+            scores.append(_calculate_step_reward(env.sim))
+        else:
+            # Nithish branch fallback: simple 3-component formula [-2.5, +0.5]
+            sim   = env.sim
+            nodes = sim.nodes
+            alive = sum(1 for n in nodes if not n.is_failed)
+            r_up  = 0.5 * (alive / max(len(nodes), 1))
+            r_lat = -0.5 * min((max(0.0, sim.latency_ms - 50.0) / 100.0) ** 2, 1.0)
+            r_db  = -2.0 if (nodes and nodes[0].is_failed) else 0.0
+            scores.append(r_up + r_lat + r_db)
 
     return scores
 
@@ -528,13 +549,16 @@ def reward_triage(
 def main() -> None:
     # ---- Load model (Unsloth FastLanguageModel + LoRA + FP8) ----
     print(f"[GRPO] Loading {MODEL_NAME} ...")
+    # fast_inference=True  → loads vLLM engine (~16GB extra), faster generation
+    # fast_inference=False → standard model.generate(), saves 16GB, safe on 40GB A100
+    FAST_INFERENCE = True   # set False if running on a 40GB GPU
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name       = MODEL_NAME,
         max_seq_length   = MAX_SEQ_LENGTH,
-        load_in_4bit     = False,        # LoRA 16-bit
-        fast_inference   = True,         # Enable vLLM
+        load_in_4bit     = False,
+        fast_inference   = FAST_INFERENCE,
         max_lora_rank    = LORA_RANK,
-        load_in_fp8      = True,         # FP8 GRPO — halves optimizer memory
+        load_in_fp8      = True,
     )
 
     model = FastLanguageModel.get_peft_model(
