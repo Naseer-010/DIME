@@ -1,10 +1,10 @@
-##!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
 
 Evaluates the autonomous reasoning capabilities of LLMs for SRE tasks.
-Features CoT reasoning, exponential backoff retries, CSV metric logging,
-and hybrid JSON/kubectl action outputs.
+Features robust CoT reasoning extraction, exponential backoff retries,
+CSV metric logging, and a strict action reconstructor to guarantee 0 crashes.
 """
 
 import json
@@ -15,10 +15,11 @@ import traceback
 import math
 import csv
 import re
+import ast
 from contextlib import contextmanager
 from pathlib import Path
 import requests
-from typing import List, Optional
+from typing import List, Optional, Dict, Tuple
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -55,7 +56,6 @@ BENCHMARK = "distributed_infra_env"
 
 client: Optional[OpenAI] = None
 
-# THE NEW PROMPT: No cheat-sheets. Just the environment rules and objectives.
 SYSTEM_PROMPT = """You are an autonomous AI Site Reliability Engineer (SRE) managing a distributed cluster.
 You receive observations about the system state as JSON and must decide the best action to maintain system health.
 
@@ -68,7 +68,7 @@ YOUR OBJECTIVES:
 1. Maximize Uptime: Prevent node failures by reducing extreme CPU loads and restarting failed nodes immediately.
 2. Minimize Latency: Keep average latency low by scaling up or throttling when necessary.
 3. Conserve Budget: Do not scale up unnecessarily. Cloud budget is limited.
-4. Maintain Throughput: Do not throttle traffic unnecessarily. Dropping too much traffic causes a massive penalty.
+4. Maintain Throughput: Do not throttle traffic unnecessarily. Dropping >70% of traffic causes a massive penalty.
 
 AVAILABLE ACTIONS (Must output exactly one of these JSON objects):
 1. Restart a failed node: {"action_type": "restart_node", "target": <node_index>, "kubectl_command": "kubectl delete pod node-<node_index>"}
@@ -89,7 +89,7 @@ Respond using the following STRICT format.
 # ---------------------------------------------------------------------------
 def init_metrics_file():
     if not METRICS_FILE.exists():
-        with open(METRICS_FILE, "w", newline="") as f:
+        with open(METRICS_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
                 [
@@ -97,6 +97,7 @@ def init_metrics_file():
                     "task_id",
                     "step",
                     "action_taken",
+                    "reasoning",
                     "reward",
                     "cumulative_score",
                     "done",
@@ -112,14 +113,17 @@ def log_to_csv(
     task_id: str,
     step: int,
     action: str,
+    reasoning: str,
     reward: float,
     score: float,
     done: bool,
     error: str,
 ):
-    with open(METRICS_FILE, "a", newline="") as f:
+    with open(METRICS_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow([MODEL_NAME, task_id, step, action, reward, score, done, error])
+        writer.writerow(
+            [MODEL_NAME, task_id, step, action, reasoning, reward, score, done, error]
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -197,24 +201,86 @@ def get_client() -> OpenAI:
     return client
 
 
-def extract_json_action(text: str) -> dict:
-    """Safely extracts the JSON object from the <action> tags."""
+def parse_llm_response(text: str) -> Tuple[dict, str]:
+    """Robustly extracts JSON action and reasoning, handling markdown and loose formatting."""
+    reasoning = "No reasoning provided."
+    action_dict = {"action_type": "no_op", "kubectl_command": "no_op"}
+
+    # Extract reasoning safely
+    res_match = re.search(
+        r"<reasoning>\s*(.*?)\s*</reasoning>", text, re.IGNORECASE | re.DOTALL
+    )
+    if res_match:
+        reasoning = res_match.group(1).strip()
+
+    # Extract Action block safely
+    act_match = re.search(
+        r"<action>\s*(.*?)\s*</action>", text, re.IGNORECASE | re.DOTALL
+    )
+    json_text = act_match.group(1) if act_match else text
+
+    # Clean up markdown code blocks if the LLM added them
+    json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
+    json_text = json_text.replace("```", "").strip()
+
     try:
-        match = re.search(r"<action>\s*({.*?})\s*</action>", text, re.DOTALL)
-        if match:
-            return json.loads(match.group(1))
+        start_idx = json_text.find("{")
+        end_idx = json_text.rfind("}")
+        if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+            clean_json = json_text[start_idx : end_idx + 1]
+            try:
+                action_dict = json.loads(clean_json)
+            except json.JSONDecodeError:
+                action_dict = ast.literal_eval(clean_json)
+    except Exception as e:
+        print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
 
-        match = re.search(r'({[^{}]*"action_type"[^{}]*})', text)
-        if match:
-            return json.loads(match.group(1))
-
-    except json.JSONDecodeError:
-        pass
-
-    return {"action_type": "no_op", "kubectl_command": "no_op"}
+    return action_dict, reasoning
 
 
-def llm_decide(observation: dict) -> dict:
+def build_safe_backend_action(action_dict: dict) -> dict:
+    """
+    STRICT RECONSTRUCTOR: Prevents FastAPI 422 Errors.
+    Guarantees the backend only receives valid keys specified in server/models.py.
+    Ignores hallucinations, extra keys, and the 'kubectl_command' string.
+    """
+    safe_action = {"action_type": action_dict.get("action_type", "no_op")}
+
+    act_type = safe_action["action_type"]
+
+    if act_type == "restart_node":
+        # Default to 0 (DB node) if target is missing or malformed
+        try:
+            safe_action["target"] = int(action_dict.get("target", 0))
+        except ValueError:
+            safe_action["target"] = 0
+
+    elif act_type == "reroute_traffic":
+        try:
+            safe_action["from_node"] = int(action_dict.get("from_node", 0))
+            safe_action["to_node"] = int(action_dict.get("to_node", 0))
+        except ValueError:
+            safe_action["action_type"] = "no_op"  # Failsafe
+
+    elif act_type == "throttle":
+        try:
+            # Bound the throttle between 0.0 and 1.0
+            raw_rate = float(action_dict.get("rate", 1.0))
+            safe_action["rate"] = max(0.0, min(1.0, raw_rate))
+        except ValueError:
+            safe_action["rate"] = 1.0
+
+    elif act_type == "scale_up":
+        pass  # scale_up requires no parameters
+
+    else:
+        # If the LLM invents an action type, default to no_op
+        safe_action["action_type"] = "no_op"
+
+    return safe_action
+
+
+def llm_decide(observation: dict) -> Tuple[dict, str]:
     obs_str = json.dumps(observation)
     user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
 
@@ -226,14 +292,14 @@ def llm_decide(observation: dict) -> dict:
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},
                 ],
-                max_tokens=350,
+                max_tokens=400,
                 temperature=0.01,
             )
             content = response.choices[0].message.content.strip()
-            parsed_action = extract_json_action(content)
+            action_dict, reasoning = parse_llm_response(content)
 
-            if "action_type" in parsed_action:
-                return parsed_action
+            if "action_type" in action_dict:
+                return action_dict, reasoning
 
         except Exception as e:
             # Exponential Backoff (2s, 4s, 8s, 16s)
@@ -246,7 +312,10 @@ def llm_decide(observation: dict) -> dict:
             time.sleep(wait_time)
 
     print("[ERROR] API repeatedly failed. Skipping turn with no_op.", flush=True)
-    return {"action_type": "no_op", "kubectl_command": "no_op"}
+    return {
+        "action_type": "no_op",
+        "kubectl_command": "no_op",
+    }, "API Error - Fallback to no_op"
 
 
 def env_reset(task_id: str) -> dict:
@@ -317,21 +386,22 @@ def run_task(task_id: str) -> dict:
         if up > 0:
             uptimes.append(up)
 
-        # 1. Get the full combined dictionary from the LLM
-        action = llm_decide(obs)
+        # 1. Get the action dict and the reasoning string
+        action_dict, reasoning = llm_decide(obs)
 
-        # 2. Stringify the FULL action (including kubectl_command) for perfect logs
-        action_str = json.dumps(action).replace('"', "'")
+        # 2. Stringify full action for CSV & format clean string for terminal
+        action_str = json.dumps(action_dict).replace('"', "'")
+        reasoning_clean = reasoning.replace("\n", " ")
+        terminal_action_str = f"act={action_str} | rsn='{reasoning_clean[:90]}...'"
 
-        # 3. Strip out 'kubectl_command' so Pydantic backend doesn't crash with a 422
-        backend_action = {k: v for k, v in action.items() if k != "kubectl_command"}
+        # 3. Use the strict reconstructor to get the perfect backend payload
+        backend_action = build_safe_backend_action(action_dict)
 
         error_msg = None
         reward = 0.0
         done = False
 
         try:
-            # Send the clean version to the server
             result = env_step(backend_action)
             data_block = result.get("data", result)
 
@@ -352,11 +422,17 @@ def run_task(task_id: str) -> dict:
 
         rewards_list.append(reward)
 
-        # Write to outputs using the FULL action string
+        # Log to outputs
         log_step(
-            step=step, action=action_str, reward=reward, done=done, error=error_msg
+            step=step,
+            action=terminal_action_str,
+            reward=reward,
+            done=done,
+            error=error_msg,
         )
-        log_to_csv(task_id, step, action_str, reward, task_score, done, error_msg)
+        log_to_csv(
+            task_id, step, action_str, reasoning, reward, task_score, done, error_msg
+        )
 
         if done or step > 100:
             success = task_score >= 0.1
