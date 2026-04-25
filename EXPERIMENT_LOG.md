@@ -471,3 +471,111 @@ python nithish_data_parser.py --csv metrics_<new_model_name>.csv
    (unsloth, vllm, transformers) with mutually exclusive version ranges required
    finding a specific `transformers==4.56.2` that satisfied all three. The install
    order also matters — vllm upgrades transformers if run first.
+
+7. **Thinking models need `/no_think` in GRPO.** Qwen3-8B generates `<think>` blocks
+   of 400–800 tokens before the actual response. With a 256-token cap, every
+   completion was truncated mid-think — `clipped_ratio = 1.0`, all rewards identical,
+   zero variance, zero gradient. Adding `/no_think` to user messages cuts completions
+   to ~55 tokens and restores learning signal immediately.
+
+8. **The GPU utilisation number tells you the real bottleneck.** 28% GPU util on an
+   A100 means the GPU is waiting on the CPU — not a GPU or VRAM problem. `reward_env`
+   creates a full `DistributedInfraEnvironment()` per completion, sequentially in
+   Python. Increasing batch×gen from 4 to 32 completions/step multiplied CPU stall
+   8× and made the run 4.8× *slower* despite having more VRAM.
+
+---
+
+## 12. Completed Training Run — 2026-04-25
+
+### Hardware
+
+| | |
+|---|---|
+| GPU | NVIDIA A100-SXM4-80GB (SXM4, 2,039 GB/s bandwidth) |
+| VRAM used | 72,041 MiB / 81,920 MiB |
+| CUDA | 13.0 / Driver 580.126.20 |
+
+### Final Config (`train_grpo_unsloth.py`)
+
+| Parameter | Value | Note |
+|---|---|---|
+| Model | `unsloth/Qwen3-8B` | BF16 weights |
+| LoRA rank | 32 | alpha=64, all proj layers |
+| Dataset episodes | 500 | 70% oracle + 30% random |
+| Dataset rows (filtered) | 5,099 | 90th-percentile prompt filter |
+| max_prompt_length | 1,040 tokens | |
+| max_completion_length | 512 tokens | hard cap; with /no_think actual avg ~57 tokens |
+| per_device_train_batch_size | 1 | CPU-bound reward functions dictate this |
+| gradient_accumulation_steps | 4 | effective batch = 4 |
+| num_generations | 4 | completions per prompt |
+| vllm_gpu_memory_utilization | 0.7 | 70% of remaining VRAM for KV cache |
+| learning_rate | 5e-6 | cosine schedule |
+| MAX_STEPS | 300 | |
+| `/no_think` in user prompt | ✅ | suppresses Qwen3 think block |
+| `compilation_config` | 0 | avoids A100 SM 8.0 piecewise graph-split crash |
+
+### Runtime
+
+| Metric | Value |
+|---|---|
+| Total time | **41 min 43 s** |
+| Step time (avg) | **8.35 s/it** |
+| train_loss | 0.000127 |
+| train_samples_per_second | 0.479 |
+
+### Training Signal (selected steps)
+
+| Step | reward total | triage/mean | triage/std | clipped_ratio | completion_len |
+|---|---|---|---|---|---|
+| 5 | +5.75 | +2.1 | 0.35 | 0.0 | 50.3 |
+| 10 | +4.32 | +1.0 | 0.0 | 0.0 | 54.4 |
+| 20 | +3.43 | +0.45 | 0.70 | 0.0 | 58.3 |
+| 127 | +4.83 | +0.95 | 0.70 | 0.0 | 58.6 |
+| ~290 | +7.34 | +3.2 | 0.0 | 0.0 | 50.7 |
+| ~295 | +5.58 | +2.2 | 0.0 | 0.0 | 55.8 |
+| 300 | +2.34 | -1.6 | 0.0 | 0.0 | 60.1 |
+
+`reward_format` held at 3.0 (perfect) from step 1 throughout.
+`reward_validity` held at 1.8–2.0 from step 1 throughout.
+Triage mean oscillated as expected for GRPO with small batch; positive on average.
+
+### Checkpoints
+
+```
+checkpoints/qwen3_grpo_unsloth/
+├── checkpoint-100/          # step 100 snapshot
+├── checkpoint-200/          # step 200 snapshot
+├── checkpoint-300/          # step 300 snapshot (= final)
+├── lora_adapter/            # final LoRA weights only (349 MB)
+└── merged_16bit/            # LoRA merged into base, BF16 (16 GB)
+```
+
+### Inference
+
+```bash
+# Use merged model (drop-in replacement for base Qwen3-8B):
+MODEL_NAME=checkpoints/qwen3_grpo_unsloth/merged_16bit python inference.py
+
+# Or point to LoRA adapter (requires Unsloth/PEFT at inference time):
+# MODEL_NAME=checkpoints/qwen3_grpo_unsloth/lora_adapter python inference.py
+```
+
+### Archive
+
+```bash
+# Tar the full checkpoint directory (no compression — safetensors don't compress):
+tar -cf qwen3_grpo_unsloth_$(date +%Y%m%d).tar checkpoints/qwen3_grpo_unsloth/
+
+# Extract on any machine:
+tar -xf qwen3_grpo_unsloth_YYYYMMDD.tar
+```
+
+### Debugging History (What Went Wrong Before the Final Run)
+
+| Attempt | Config | Issue | Step time | Outcome |
+|---|---|---|---|---|
+| Run 1 (A100-40GB) | batch=1, gen=4, steps=500 | `compilation_config` not set → vLLM crash | — | Killed |
+| Run 2 (A100-80GB) | batch=4, gen=8, steps=300 | reward_env CPU stall: 32 completions × 3s = 96s CPU/step | 126 s/step → 10h est. | Killed |
+| Run 3 (A100-80GB) | batch=1, gen=4, steps=300, max_comp=256 | Qwen3 `<think>` blocks truncated at 256 tokens; `clipped_ratio=1.0`, all rewards identical, zero variance | 20 s/step but 0 learning | Killed |
+| **Run 4 (Final)** | batch=1, gen=4, steps=300, max_comp=512, `/no_think` | — | **8.35 s/step** | ✅ Completed |
