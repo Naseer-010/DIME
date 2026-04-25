@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-LLM Agent Inference Loop for Distributed Infrastructure Environment.
+LLM Agent Inference Loop for Distributed Infrastructure Environment (DIME).
 
-Runs the LLM agent against all graded tasks and reports scores.
-Strictly adheres to the Meta-PyTorch OpenEnv Hackathon STDOUT format.
-
-Updated to use kubectl/AWS CLI command syntax (real-world action schemas).
+Runs the LLM agent against all graded tasks and reports model-specific
+performance summaries to structured log files. Strictly adheres to the
+Meta-PyTorch OpenEnv Hackathon STDOUT format.
 """
 
 import json
@@ -13,10 +12,11 @@ import os
 import sys
 import time
 import traceback
+import math
 from contextlib import contextmanager
 from pathlib import Path
 import requests
-from typing import List, Optional
+from typing import List, Optional, Dict
 from openai import OpenAI
 
 # ---------------------------------------------------------------------------
@@ -24,13 +24,9 @@ from openai import OpenAI
 # ---------------------------------------------------------------------------
 
 API_BASE_URL = os.environ.get("API_BASE_URL", "https://router.huggingface.co/v1")
-
 API_KEY = os.environ.get("API_KEY") or os.environ.get("HF_TOKEN")
-
 MODEL_NAME = os.environ.get("MODEL_NAME", "meta-llama/Llama-3.1-8B-Instruct")
-
 ENV_SERVER_URL = os.environ.get("ENV_SERVER_URL", "http://localhost:7860")
-LOG_FILE = Path(__file__).resolve().parent / "logs.txt"
 
 TASKS = [
     "traffic_spike",
@@ -94,6 +90,12 @@ Respond with ONLY the kubectl command or "no_op". No markdown, no explanation.""
 # ---------------------------------------------------------------------------
 
 
+def get_log_path(model_name: str) -> Path:
+    """Generate a dynamic, safe log file name based on the model being tested."""
+    safe_name = model_name.replace("/", "_").replace(".", "_")
+    return Path(__file__).resolve().parent / f"logs_{safe_name}.txt"
+
+
 class TeeStream:
     """Write stream output to the terminal and a log file."""
 
@@ -132,7 +134,7 @@ def tee_output(log_path: Path):
 
 
 def log_start(task: str, env: str, model: str) -> None:
-    print(f"[START] task={task} env={env} model={model}", flush=True)
+    print(f"\n[START] task={task} env={env} model={model}", flush=True)
 
 
 def log_step(
@@ -228,24 +230,38 @@ def env_step(action: dict) -> dict:
     return response.json()
 
 
-def run_task(task_id: str) -> float:
-    log_start(task=task_id, env=BENCHMARK, model=MODEL_NAME)
+def run_task(task_id: str, model_name: str) -> dict:
+    log_start(task=task_id, env=BENCHMARK, model=model_name)
 
     try:
         obs = env_reset(task_id)
     except Exception as e:
         log_end(success=False, steps=0, score=0.0, rewards=[])
-        return 0.0
+        return {
+            "task": task_id,
+            "score": 0.0,
+            "avg_latency": 0.0,
+            "avg_uptime": 0.0,
+            "total_steps": 0,
+        }
 
     step = 0
     rewards_list = []
-
-    # Initialize task_score outside the loop so we always have a value
-    # even if the loop breaks early or errors out.
+    latencies = []
+    uptimes = []
     task_score = 0.0
 
     while True:
         step += 1
+
+        # Track metrics if present in the observation
+        lat = float(obs.get("latency_ms", 0.0))
+        up = float(obs.get("uptime_pct", 0.0))
+        if lat > 0:
+            latencies.append(lat)
+        if up > 0:
+            uptimes.append(up)
+
         action = llm_decide(obs)
 
         # Format action strictly on one line without quotes that break bash/parsing
@@ -269,7 +285,7 @@ def run_task(task_id: str) -> float:
             reward = float(data_block.get("reward", obs.get("reward", 0.0)))
             done = bool(data_block.get("done", obs.get("done", False)))
 
-            # This continuously updates the task_score on every single step.
+            # Continuously update task_score
             task_score = float(obs.get("task_score", 0.0))
 
         except Exception as e:
@@ -284,18 +300,77 @@ def run_task(task_id: str) -> float:
         if done or step > 100:
             success = task_score >= 0.1
             log_end(success=success, steps=step, score=task_score, rewards=rewards_list)
-            return task_score
+
+            avg_lat = sum(latencies) / len(latencies) if latencies else 0.0
+            avg_up = sum(uptimes) / len(uptimes) if uptimes else 0.0
+
+            return {
+                "task": task_id,
+                "score": task_score,
+                "avg_latency": avg_lat,
+                "avg_uptime": avg_up,
+                "total_steps": step,
+            }
 
 
 def main():
-    for task_id in TASKS:
-        run_task(task_id)
+    log_path = get_log_path(MODEL_NAME)
+    all_task_stats = []
+
+    with tee_output(log_path):
+        print(f"==================================================")
+        print(f"  STARTING DIME EVALUATION SESSION: {MODEL_NAME}")
+        print(f"==================================================")
+
+        for task_id in TASKS:
+            stats = run_task(task_id, MODEL_NAME)
+            all_task_stats.append(stats)
+
+        # -----------------------------------------------------------
+        # FINAL STRUCTURED SUMMARY FOR JUDGES
+        # -----------------------------------------------------------
+        print("\n" + "=" * 80)
+        print(f"FINAL PERFORMANCE SUMMARY: {MODEL_NAME}")
+        print("=" * 80)
+        print(
+            f"{'Task Name':<25} | {'Task Score':<12} | {'Uptime %':<12} | {'Avg Latency (ms)':<15}"
+        )
+        print("-" * 80)
+
+        for s in all_task_stats:
+            print(
+                f"{s['task']:<25} | {s['score']:<12.4f} | {s['avg_uptime']:<12.1f} | {s['avg_latency']:<15.1f}"
+            )
+
+        # Calculate Overarching Performance Metric (DIME Index)
+        # Using a weighted calculation: (Avg Task Score * Avg Uptime) / log(Safe Latency)
+        overall_score = sum(s["score"] for s in all_task_stats) / max(
+            len(all_task_stats), 1
+        )
+        avg_system_uptime = sum(s["avg_uptime"] for s in all_task_stats) / max(
+            len(all_task_stats), 1
+        )
+
+        # Ensure latency > 1 to avoid ZeroDivisionError or negative logs
+        avg_system_latency = sum(s["avg_latency"] for s in all_task_stats) / max(
+            len(all_task_stats), 1
+        )
+        safe_lat = max(avg_system_latency, 2.0)
+
+        dime_index = (overall_score * avg_system_uptime) / math.log(safe_lat)
+
+        print("-" * 80)
+        print(f"Overall Task Completion Score : {overall_score:.4f}")
+        print(f"Mean System Uptime            : {avg_system_uptime:.1f}%")
+        print(f"Mean System Latency           : {avg_system_latency:.1f} ms")
+        print("=" * 80)
+        print(f"OVERALL DIME INDEX (Higher=Better): {dime_index:.4f}")
+        print("=" * 80)
 
 
 if __name__ == "__main__":
-    with tee_output(LOG_FILE):
-        try:
-            main()
-        except Exception:
-            traceback.print_exc()
-            raise SystemExit(1)
+    try:
+        main()
+    except Exception:
+        traceback.print_exc()
+        raise SystemExit(1)
