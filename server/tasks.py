@@ -323,8 +323,10 @@ def _setup_alibaba_trace(env: "DistributedInfraEnvironment", rng: "random.Random
     from server.trace_loader import load_default_trace
 
     sim = env.sim
-    sim.max_steps = 60  # ~30 minutes of real time at 30s intervals
+    sim.max_steps = 60  # ~30 minutes of real time at 30s intervals (or longer trace window)
     sim.cloud_budget = 8  # tight budget
+    sim.error_budget = 100.0
+    sim.scenario = sim.task_id
 
     trace = load_default_trace()
     if trace is not None:
@@ -499,6 +501,90 @@ TASKS = {
             "Node 0 is the DATABASE (single point of failure). Nodes 1-7 are app servers. "
             "New nodes have a 3-step cold start. Budget is tight (8 credits). "
             "Read Prometheus metrics carefully — they follow production scrape format."
+        ),
+    },
+    # --- Level 5 Trace-backed chaos scenarios (aliases for evaluation loops) ---
+    "thundering_herd": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "THUNDERING HERD: Sudden heavy-tailed traffic spikes drive tail latency and "
+            "retry amplification. Use throttling judiciously to prevent runaway retries "
+            "while protecting the DB (node 0)."
+        ),
+    },
+    "zombie_node": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "ZOMBIE NODE: A worker may appear underutilized while contributing to severe "
+            "tail latency. Consider rerouting away from suspicious nodes and restarting "
+            "if needed."
+        ),
+    },
+    "memory_leak_slow_burn": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "MEMORY LEAK (SLOW BURN): One worker's memory creeps upward toward an OOM cliff. "
+            "Scaling does not fix leaks—restart the leaking pod before it crosses the cliff."
+        ),
+    },
+    "split_brain_io_bottleneck": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "SPLIT-BRAIN / IO BOTTLENECK: The database disk (node 0) can saturate (high io_wait). "
+            "Avoid scaling when DB I/O is pegged; shed load to protect the SPOF."
+        ),
+    },
+    "black_swan_az_failure": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "BLACK SWAN: Multi-node failures can cascade. Prioritize survivor protection "
+            "and graceful load shedding while recovering failed capacity."
+        ),
+    },
+    "retry_storm": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "RETRY STORM: Tail latency spikes can induce exponential retries. Break the loop "
+            "with traffic throttling before the DB collapses."
+        ),
+    },
+    "hot_shard_skew": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "HOT SHARD / SKEW: One worker may run hot while others remain cool. Prefer traffic "
+            "shifts (reroute) over scaling when the cluster has spare headroom."
+        ),
+    },
+    "connection_pool_deadlock": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "CONNECTION POOL DEADLOCK: Symptoms can look like low CPU with high latency. "
+            "Reroute away from the stuck node or restart it to clear deadlocks."
+        ),
+    },
+    "autoscaler_flapping_trap": {
+        "setup": _setup_alibaba_trace,
+        "grade": _grade_alibaba_trace,
+        "is_done": _is_done_alibaba_trace,
+        "hint": (
+            "AUTOSCALER FLAPPING TRAP: Avoid overreacting to small oscillations. Prefer no_op "
+            "when stable, and make only high-confidence interventions."
         ),
     },
 }

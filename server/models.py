@@ -101,6 +101,32 @@ class InfraObservation(Observation):
     request_rate: float = Field(
         description="Incoming requests per second into the system."
     )
+    mem_utilizations: List[float] = Field(
+        default_factory=list,
+        description="Memory utilization [0.0, 1.0] per node (same ordering as cpu_loads).",
+    )
+    io_wait: float = Field(
+        default=0.0,
+        description="Database disk I/O wait / saturation proxy in [0.0, 1.0].",
+    )
+    p99_latency: float = Field(
+        default=0.0,
+        description="P99 tail latency in milliseconds.",
+    )
+    error_budget: float = Field(
+        default=100.0,
+        description="Remaining error budget token bucket for throttling actions.",
+    )
+
+    # --- ML-friendly normalized features ---
+    request_rate_norm: float = Field(
+        default=0.0,
+        description="request_rate normalized to [0,1] (divide by 5000.0, clipped).",
+    )
+    p99_latency_norm: float = Field(
+        default=0.0,
+        description="p99_latency normalized to [0,1] (divide by 1000.0, clipped).",
+    )
     step: int = Field(description="Current step within the episode.")
     task_hint: str = Field(
         description="Natural language description of the current task objective."

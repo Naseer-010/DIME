@@ -50,37 +50,71 @@ TASKS = [
     "cascading_failure",
     "flash_crowd",
     "level_5_alibaba_trace",
+    "thundering_herd",
+    "zombie_node",
+    "memory_leak_slow_burn",
+    "split_brain_io_bottleneck",
+    "black_swan_az_failure",
+    "retry_storm",
+    "hot_shard_skew",
+    "connection_pool_deadlock",
+    "autoscaler_flapping_trap",
 ]
 MAX_RETRIES = 4
 BENCHMARK = "distributed_infra_env"
 
 client: Optional[OpenAI] = None
 
-SYSTEM_PROMPT = """You are an autonomous AI Site Reliability Engineer (SRE) managing a distributed cluster.
-You receive observations about the system state as JSON and must decide the best action to maintain system health.
+SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
+You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
 
-CLUSTER ARCHITECTURE:
-- Node 0 is the DATABASE — a single point of failure. If it fails, all processing stops.
-- Nodes 1-7 are APP SERVERS.
-- Scaling up adds new nodes, but they have a 3-step cold start.
+CLUSTER ARCHITECTURE & PHYSICS:
+- Node 0 is the stateful DATABASE (SPOF). Nodes 1-7 are stateless APP WORKERS.
+- NEW METRICS: You now see 'mem_utilizations' (RAM), 'io_wait' (Disk), 'p99_latency' (Tail risk), and 'error_budget'.
+- MEMORY CLIFF: If ANY node hits > 0.98 mem_utilization, it suffers an instant OOM Kill. 
+- COLD START: Scaling up takes 3 steps to boot.
+- ERROR BUDGET: Throttling traffic saves the DB but burns your finite Error Budget.
 
-YOUR OBJECTIVES:
-1. Maximize Uptime: Prevent node failures by reducing extreme CPU loads and restarting failed nodes immediately.
-2. Minimize Latency: Keep average latency low by scaling up or throttling when necessary.
-3. Conserve Budget: Do not scale up unnecessarily. Cloud budget is limited.
-4. Maintain Throughput: Do not throttle traffic unnecessarily. Dropping >70% of traffic causes a massive penalty.
+Available commands:
+- kubectl delete pod node-<ID>           → restart a node (clears memory leaks and deadlocks)
+- kubectl scale deployment frontend --replicas=10  → scale up (takes 3 steps to boot)
+- kubectl exec -it istio-proxy -- traffic shift --from=<ID> --to=<ID>  → reroute traffic away from a bad node
+- kubectl throttle ingress --rate=<float>  → drop traffic (0.0 to 1.0). Burns error budget!
+- kubectl logs node-<ID>                 → investigate telemetry timeout
+- no_op                                  → do nothing
 
-AVAILABLE ACTIONS (Must output exactly one of these JSON objects):
-1. Restart a failed node: {"action_type": "restart_node", "target": <node_index>, "kubectl_command": "kubectl delete pod node-<node_index>"}
-2. Scale up capacity: {"action_type": "scale_up", "kubectl_command": "kubectl scale deployment frontend --replicas=10"}
-3. Reroute traffic: {"action_type": "reroute_traffic", "from_node": <index>, "to_node": <index>, "kubectl_command": "kubectl exec -it istio-proxy -- traffic shift --from=<from_node> --to=<to_node>"}
-4. Throttle ingress: {"action_type": "throttle", "rate": <float between 0.3 and 1.0>, "kubectl_command": "kubectl throttle ingress --rate=<rate>"}
-5. Do nothing: {"action_type": "no_op", "kubectl_command": "no_op"}
+CRITICAL INCIDENT TRIAGE TREE (Follow strictly in order):
+1. OOM IMMINENT (Memory Leak): IF ANY 'mem_utilizations' > 0.92:
+   IMMEDIATELY output: kubectl delete pod node-5 (or whichever node is leaking. Scaling does NOT fix memory leaks!)
+   
+2. SPLIT-BRAIN (Disk I/O Bottleneck): IF node_0 'io_wait' > 0.80:
+   Output: kubectl throttle ingress --rate=0.5 (Do NOT scale up; more workers will lock the DB disk further).
 
-Respond using the following STRICT format. 
-<reasoning>Analyze the current metrics, identify risks, and explain your strategy based on the objectives.</reasoning>
+3. HOT SHARD (Load Balancer Skew): IF one worker's CPU > 0.90 but the cluster average is low:
+   Output: kubectl exec -it istio-proxy -- traffic shift --from=<high_cpu_node> --to=<low_cpu_node>
+
+4. RETRY STORM / THUNDERING HERD: IF 'p99_latency' > 100.0 AND traffic is spiking:
+   Output: kubectl throttle ingress --rate=0.4 (Break the exponential retry loop).
+
+5. CONNECTION DEADLOCK (Zombie Node): IF a worker's CPU is incredibly low (< 0.10) BUT 'p99_latency' is huge:
+   Output: kubectl exec -it istio-proxy -- traffic shift --from=<zombie_node> --to=<healthy_node>
+
+6. BLACK SWAN (Multi-Node Death): IF multiple nodes are in 'failed_nodes':
+   Output: kubectl throttle ingress --rate=0.3 (Shed load to protect survivors while you recover).
+
+7. DATABASE SURVIVAL: IF node-0 (DB) cpu_load > 0.80:
+   Output: kubectl throttle ingress --rate=0.7
+
+8. SAFE SCALING: IF avg worker CPU > 0.75 AND 'error_budget' > 20:
+   Output: kubectl scale deployment frontend --replicas=10
+
+9. HEALTHY / FLAPPING TRAP: If metrics are stable or oscillating slightly:
+   Output: no_op
+
+Respond using the following STRICT format. You must include the XML reasoning tags:
+<reasoning>Diagnose the telemetry. Identify which of the 9 Triage rules applies.</reasoning>
 <action>
-{"action_type": "...", "kubectl_command": "..."}
+{"command": "your_kubectl_command_or_no_op_here"}
 </action>"""
 
 
@@ -219,19 +253,23 @@ def parse_llm_response(text: str) -> Tuple[dict, str]:
     )
     json_text = act_match.group(1) if act_match else text
 
+    # Strip everything outside the outermost JSON brackets if tags failed
+    start_idx = json_text.find("{")
+    end_idx = json_text.rfind("}")
+    if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
+        json_text = json_text[start_idx : end_idx + 1]
+    else:
+        json_text = '{"command": "no_op"}'  # Total failure fallback
+
     # Clean up markdown code blocks if the LLM added them
     json_text = re.sub(r"```[a-zA-Z]*", "", json_text)
     json_text = json_text.replace("```", "").strip()
 
     try:
-        start_idx = json_text.find("{")
-        end_idx = json_text.rfind("}")
-        if start_idx != -1 and end_idx != -1 and end_idx >= start_idx:
-            clean_json = json_text[start_idx : end_idx + 1]
-            try:
-                action_dict = json.loads(clean_json)
-            except json.JSONDecodeError:
-                action_dict = ast.literal_eval(clean_json)
+        try:
+            action_dict = json.loads(json_text)
+        except json.JSONDecodeError:
+            action_dict = ast.literal_eval(json_text)
     except Exception as e:
         print(f"[DEBUG] Parser failed to extract action: {str(e)}", flush=True)
 
@@ -242,39 +280,44 @@ def build_safe_backend_action(action_dict: dict) -> dict:
     """
     STRICT RECONSTRUCTOR: Prevents FastAPI 422 Errors.
     Guarantees the backend only receives valid keys specified in server/models.py.
-    Ignores hallucinations, extra keys, and the 'kubectl_command' string.
+    Prioritizes 'raw_command' syntax to allow the backend's regex parser to do the heavy lifting.
     """
-    safe_action = {"action_type": action_dict.get("action_type", "no_op")}
+    # 1. If the LLM successfully formatted the new prompt, it output a "command" key.
+    # We must translate this to "raw_command" for the backend parser and satisfy Pydantic.
+    if isinstance(action_dict, dict) and (
+        "command" in action_dict or "raw_command" in action_dict
+    ):
+        cmd = str(
+            action_dict.get("command") or action_dict.get("raw_command") or "no_op"
+        ).strip()
+        return {"action_type": "no_op", "raw_command": cmd}
 
+    # 2. Fallback: If the LLM hallucinates an old schema (e.g., outputs {"action_type": "throttle", "rate": 0.5})
+    # We map it safely.
+    safe_action = {"action_type": action_dict.get("action_type", "no_op")}
     act_type = safe_action["action_type"]
 
-    if act_type == "restart_node":
-        # Default to 0 (DB node) if target is missing or malformed
+    if act_type == "restart_node" or act_type == "query_logs":
         try:
             safe_action["target"] = int(action_dict.get("target", 0))
-        except ValueError:
+        except (ValueError, TypeError):
             safe_action["target"] = 0
 
     elif act_type == "reroute_traffic":
         try:
             safe_action["from_node"] = int(action_dict.get("from_node", 0))
             safe_action["to_node"] = int(action_dict.get("to_node", 0))
-        except ValueError:
-            safe_action["action_type"] = "no_op"  # Failsafe
+        except (ValueError, TypeError):
+            safe_action["action_type"] = "no_op"
 
     elif act_type == "throttle":
         try:
-            # Bound the throttle between 0.0 and 1.0
             raw_rate = float(action_dict.get("rate", 1.0))
             safe_action["rate"] = max(0.0, min(1.0, raw_rate))
-        except ValueError:
+        except (ValueError, TypeError):
             safe_action["rate"] = 1.0
 
-    elif act_type == "scale_up":
-        pass  # scale_up requires no parameters
-
-    else:
-        # If the LLM invents an action type, default to no_op
+    elif act_type not in ["scale_up", "no_op"]:
         safe_action["action_type"] = "no_op"
 
     return safe_action
@@ -298,7 +341,7 @@ def llm_decide(observation: dict) -> Tuple[dict, str]:
             content = response.choices[0].message.content.strip()
             action_dict, reasoning = parse_llm_response(content)
 
-            if "action_type" in action_dict:
+            if "action_type" in action_dict or "command" in action_dict:
                 return action_dict, reasoning
 
         except Exception as e:

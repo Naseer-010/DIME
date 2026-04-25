@@ -20,6 +20,8 @@ class TraceStep:
 
     request_rate: float = 100.0
     latency_injection: float = 0.0
+    p99_latency: float = 0.0
+    node_0_io: float = 0.0
     node_cpu: Dict[int, float] = field(default_factory=dict)
     node_mem: Dict[int, float] = field(default_factory=dict)
 
@@ -29,7 +31,12 @@ class TraceReplay:
     Load and replay a trace CSV file step-by-step.
 
     The CSV must have columns:
-        step, node_0_cpu, node_0_mem, ..., request_rate, latency_injection
+        step, node_0_cpu, node_0_mem, ..., request_rate
+
+    Optionally supports:
+        - latency_injection
+        - p99_latency
+        - node_0_io
 
     Wraps around if the episode exceeds the trace length.
     """
@@ -47,7 +54,9 @@ class TraceReplay:
             for row in reader:
                 ts = TraceStep(
                     request_rate=float(row["request_rate"]),
-                    latency_injection=float(row["latency_injection"]),
+                    latency_injection=float(row.get("latency_injection", 0.0) or 0.0),
+                    p99_latency=float(row.get("p99_latency", 0.0) or 0.0),
+                    node_0_io=float(row.get("node_0_io", 0.0) or 0.0),
                 )
                 # Parse per-node metrics
                 for key, val in row.items():
@@ -76,10 +85,15 @@ class TraceReplay:
 _DEFAULT_TRACE = os.path.join(
     os.path.dirname(__file__), "traces", "alibaba_v2021_8node_500steps.csv"
 )
+_REAL_TRACE = os.path.join(
+    os.path.dirname(__file__), "traces", "real_production_trace.csv"
+)
 
 
 def load_default_trace() -> Optional[TraceReplay]:
-    """Load the bundled Alibaba trace, or None if not generated yet."""
+    """Load the best available trace, or None if missing."""
+    if os.path.exists(_REAL_TRACE):
+        return TraceReplay(_REAL_TRACE)
     if os.path.exists(_DEFAULT_TRACE):
         return TraceReplay(_DEFAULT_TRACE)
     return None

@@ -16,7 +16,7 @@ from uuid import uuid4
 from openenv.core.env_server.interfaces import Environment
 
 from server.models import InfraAction, InfraObservation, InfraState
-from server.rubrics import compute_composite_reward
+from server.rubrics import compute_composite_reward, calculate_step_reward
 from server.command_parser import (
     CommandParseError,
     has_reasoning_json_format,
@@ -92,6 +92,7 @@ class SimulationState:
 
     # --- Anti-hacking sandbox ---
     cloud_budget: int = 10  # scale_up credits
+    error_budget: float = 100.0  # throttle token bucket
     action_cooldowns: Dict[str, Dict[int, int]] = field(default_factory=dict)
     # e.g. {"restart_node": {3: 4}}  → node 3 has 4 steps of cooldown left
     action_errors: List[str] = field(default_factory=list)
@@ -101,6 +102,10 @@ class SimulationState:
 
     # --- Trace replay ---
     trace_replay: Any = None  # Optional[TraceReplay]
+    last_trace_p99_latency: float = 0.0
+    last_trace_node_0_io: float = 0.0
+    scenario: str = ""  # task-specific chaos scenario overlay
+    _black_swan_applied: bool = False
 
     # --- Throughput tracking (anti-exploit) ---
     total_requests_received: int = 0
@@ -244,6 +249,7 @@ class DistributedInfraEnvironment(Environment):
             episode_id=episode_id or str(uuid4()),
             curriculum_level=curriculum_level,
             cloud_budget=max(5, 15 - curriculum_level * 2),  # harder = tighter budget
+            error_budget=100.0,
         )
 
         # Apply task-specific setup
@@ -275,11 +281,17 @@ class DistributedInfraEnvironment(Environment):
         sim.previous_nodes = deepcopy(sim.nodes)
         sim.previous_active_nodes = sum(1 for n in sim.nodes if not n.is_failed)
 
+        # 0.5 Error budget regen (token bucket economics)
+        sim.error_budget = min(100.0, sim.error_budget + 2.0)
+
         # 1. Process agent action (handles raw_command, budgets, cooldowns)
         self._apply_action(action)
 
         # 2. Simulate request arrivals
         self._simulate_requests()
+
+        # 2.5 Apply task-specific chaos overlays (deceptive signals, correlated failures)
+        self._apply_scenario_overlays()
 
         # 3. Update node states (restarts, TTLs)
         self._tick_node_timers()
@@ -456,25 +468,52 @@ class DistributedInfraEnvironment(Environment):
                 sim.adjacency[c].append(new_idx)
 
         elif action.action_type == "throttle":
+            # --- Action masking: throttling burns finite error budget ---
+            if sim.error_budget <= 0:
+                sim.action_errors.append("ACTION FAILED: Error budget exhausted")
+                sim.last_action_type = "no_op"
+                return
             if action.rate is not None:
                 sim.throttle_rate = action.rate
+                # Burn budget proportional to traffic dropped (more drop = more budget burn)
+                burn = max(0.0, min(1.0, 1.0 - float(action.rate))) * 10.0
+                sim.error_budget = max(0.0, sim.error_budget - burn)
 
     # ----- Simulation dynamics -----
 
     def _simulate_requests(self) -> None:
         """Simulate incoming request arrivals (trace replay or Gaussian)."""
         sim = self._sim
+        scenario = (sim.scenario or sim.task_id or "").strip()
 
         # --- Trace replay: override request rate from real data ---
         if sim.trace_replay is not None:
             trace_step = sim.trace_replay.get_step(sim.step_count)
             sim.current_request_rate = trace_step.request_rate
+            sim.last_trace_p99_latency = float(getattr(trace_step, "p99_latency", 0.0) or 0.0)
+            sim.last_trace_node_0_io = float(getattr(trace_step, "node_0_io", 0.0) or 0.0)
+
+            # Scenario-specific caps so "named incidents" don't instantly devolve into pure overload.
+            if scenario == "memory_leak_slow_burn":
+                sim.current_request_rate = min(sim.current_request_rate, 220.0)
+            elif scenario == "black_swan_az_failure":
+                sim.current_request_rate = min(sim.current_request_rate, 260.0)
+            elif scenario in {"zombie_node", "connection_pool_deadlock", "hot_shard_skew"}:
+                sim.current_request_rate = min(sim.current_request_rate, 280.0)
             # Inject per-node CPU baselines from trace
             for node_idx, cpu_val in trace_step.node_cpu.items():
                 if node_idx < len(sim.nodes) and not sim.nodes[node_idx].is_failed:
                     # Blend trace CPU with simulation dynamics (60% trace, 40% sim)
                     sim.nodes[node_idx].cpu_util = (
                         0.6 * cpu_val + 0.4 * sim.nodes[node_idx].cpu_util
+                    )
+            # Inject per-node memory baselines from trace (if present)
+            for node_idx, mem_val in getattr(trace_step, "node_mem", {}).items():
+                if node_idx < len(sim.nodes) and not sim.nodes[node_idx].is_failed:
+                    if scenario == "memory_leak_slow_burn" and node_idx == 5:
+                        continue
+                    sim.nodes[node_idx].memory_util = (
+                        0.7 * float(mem_val) + 0.3 * sim.nodes[node_idx].memory_util
                     )
             # Add trace latency injection
             sim.latency_ms += trace_step.latency_injection * 0.3
@@ -560,6 +599,7 @@ class DistributedInfraEnvironment(Environment):
     def _distribute_load(self) -> None:
         """Process queued requests → affect CPU utilization (with cold start + DB dependency)."""
         sim = self._sim
+        scenario = (sim.scenario or sim.task_id or "").strip()
 
         # Find the DB node for dependency calculations
         db_node = None
@@ -597,6 +637,7 @@ class DistributedInfraEnvironment(Environment):
                 and db_node is not None
                 and db_available
                 and processed > 0
+                and scenario != "memory_leak_slow_burn"
             ):
                 db_load = processed * 0.006  # each request costs DB ~0.6% CPU
                 db_node.cpu_util = min(1.0, db_node.cpu_util + db_load)
@@ -605,6 +646,10 @@ class DistributedInfraEnvironment(Environment):
             # CPU effect: each processed request adds load, with natural decay
             cpu_from_queue = node.queue_length * 0.008
             cpu_from_processing = processed * 0.012
+            if scenario == "memory_leak_slow_burn" and i == 5:
+                # Make the leak deceptive: CPU stays "fine" while memory creeps up.
+                cpu_from_queue = 0.0
+                cpu_from_processing = 0.0
             natural_decay = 0.05
 
             node.cpu_util = max(
@@ -658,6 +703,24 @@ class DistributedInfraEnvironment(Environment):
 
         for i, node in enumerate(sim.nodes):
             if node.is_failed or node.restart_countdown > 0:
+                continue
+
+            # --- OOM cliff: instant failure above 0.98 memory ---
+            if node.memory_util >= 0.98:
+                node.is_failed = True
+                node.high_cpu_streak = 0
+                newly_failed.append(i)
+                sim.action_errors.append(f"OOMKilled: Node-{i} memory exceeded 98%.")
+                continue
+
+            # --- DB SPOF fatality: hard crash at 100% CPU ---
+            if node.role == "database" and node.cpu_util >= 1.0:
+                node.is_failed = True
+                node.high_cpu_streak = 0
+                newly_failed.append(i)
+                sim.action_errors.append(
+                    "CRITICAL: Database Node-0 crashed due to 100% CPU lockup."
+                )
                 continue
 
             if node.cpu_util > HIGH_CPU_THRESHOLD:
@@ -734,9 +797,12 @@ class DistributedInfraEnvironment(Environment):
             self._last_rubric_breakdown = {}
             return 0.0
 
-        reward, breakdown = compute_composite_reward(sim)
+        # Keep OpenEnv composable rubric breakdown for evaluation/analysis
+        _, breakdown = compute_composite_reward(sim)
         self._last_rubric_breakdown = breakdown
-        return reward
+
+        # Use ProductionSREReward for the actual RL training signal
+        return float(calculate_step_reward(sim, is_dead=False))
 
     # ----- Observation builder -----
 
@@ -751,6 +817,7 @@ class DistributedInfraEnvironment(Environment):
 
         # --- Partial observability: 5% telemetry dropout per node ---
         cpu_loads = []
+        mem_utils = []
         queue_lengths = []
         telemetry_status: Dict[int, str] = {}
 
@@ -763,6 +830,14 @@ class DistributedInfraEnvironment(Environment):
                 new_dropouts.append(i)
         sim.telemetry_dropout_nodes = new_dropouts
 
+        # For targeted incident tasks, keep key nodes observable to prevent
+        # learning collapse due to missing critical features.
+        scenario = (sim.scenario or sim.task_id or "").strip()
+        if scenario == "memory_leak_slow_burn":
+            sim.telemetry_dropout_nodes = [
+                i for i in sim.telemetry_dropout_nodes if i not in (0, 5)
+            ]
+
         # --- Build Prometheus-style metrics ---
         prometheus_metrics: List[Dict[str, Any]] = []
         ts = sim.step_count * 30  # simulate 30s intervals
@@ -773,6 +848,7 @@ class DistributedInfraEnvironment(Environment):
 
             if is_dropped:
                 cpu_loads.append(-1.0)
+                mem_utils.append(-1.0)
                 queue_lengths.append(-1)
                 telemetry_status[i] = "timeout"
                 prometheus_metrics.append(
@@ -785,6 +861,7 @@ class DistributedInfraEnvironment(Environment):
                 )
             else:
                 cpu_loads.append(round(node.cpu_util, 3))
+                mem_utils.append(round(node.memory_util, 3))
                 queue_lengths.append(node.queue_length)
                 telemetry_status[i] = "ok"
                 prometheus_metrics.extend(
@@ -829,9 +906,27 @@ class DistributedInfraEnvironment(Environment):
                     "timestamp": ts,
                 },
                 {
+                    "metric": "cluster_p99_latency_ms",
+                    "labels": {},
+                    "value": round(sim.last_trace_p99_latency, 2),
+                    "timestamp": ts,
+                },
+                {
+                    "metric": "db_node_0_io_wait",
+                    "labels": {},
+                    "value": round(sim.last_trace_node_0_io, 4),
+                    "timestamp": ts,
+                },
+                {
                     "metric": "cluster_request_rate",
                     "labels": {},
                     "value": round(sim.current_request_rate * sim.throttle_rate, 2),
+                    "timestamp": ts,
+                },
+                {
+                    "metric": "cluster_error_budget",
+                    "labels": {},
+                    "value": round(sim.error_budget, 2),
                     "timestamp": ts,
                 },
                 {
@@ -843,12 +938,23 @@ class DistributedInfraEnvironment(Environment):
             ]
         )
 
+        raw_rr = float(sim.current_request_rate * sim.throttle_rate)
+        raw_p99 = float(sim.last_trace_p99_latency)
+        rr_norm = max(0.0, min(1.0, raw_rr / 5000.0))
+        p99_norm = max(0.0, min(1.0, raw_p99 / 1000.0))
+
         return InfraObservation(
             cpu_loads=cpu_loads,
+            mem_utilizations=mem_utils,
             queue_lengths=queue_lengths,
             failed_nodes=[i for i, n in enumerate(sim.nodes) if n.is_failed],
             latency_ms=round(sim.latency_ms, 2),
-            request_rate=round(sim.current_request_rate * sim.throttle_rate, 2),
+            request_rate=round(raw_rr, 2),
+            io_wait=round(sim.last_trace_node_0_io, 4),
+            p99_latency=round(sim.last_trace_p99_latency, 2),
+            error_budget=round(sim.error_budget, 2),
+            request_rate_norm=round(rr_norm, 6),
+            p99_latency_norm=round(p99_norm, 6),
             step=sim.step_count,
             task_hint=task_hint,
             done=False,
@@ -858,3 +964,88 @@ class DistributedInfraEnvironment(Environment):
             cloud_budget=sim.cloud_budget,
             prometheus_metrics=prometheus_metrics,
         )
+
+    def _apply_scenario_overlays(self) -> None:
+        """
+        Task-specific chaos overlays to produce deceptive signals and correlated failures.
+
+        These overlays are intentionally simple and deterministic so RL can learn them.
+        They are applied on top of trace replay + base simulation dynamics.
+        """
+        sim = self._sim
+        scenario = (sim.scenario or sim.task_id or "").strip()
+
+        # --- Retry storm: if tail latency crosses threshold, traffic doubles next step ---
+        if scenario in {"retry_storm", "thundering_herd"}:
+            if sim.last_trace_p99_latency > 50.0 or sim.latency_ms > 50.0:
+                sim.current_request_rate *= 2.0
+                for n in sim.nodes:
+                    if not n.is_failed and n.restart_countdown == 0:
+                        n.cpu_util = min(1.0, n.cpu_util + 0.25)
+
+        # --- Hot shard skew: one worker melts while others look idle ---
+        if scenario == "hot_shard_skew":
+            hot = 2
+            for i, n in enumerate(sim.nodes):
+                if n.role != "app_server" or n.is_failed or n.restart_countdown > 0:
+                    continue
+                if i == hot:
+                    n.cpu_util = min(1.0, n.cpu_util + 0.40)
+                else:
+                    n.cpu_util = max(0.05, min(n.cpu_util, 0.20))
+
+        # --- Zombie node / deadlock: low CPU but massive tail latency ---
+        if scenario in {"zombie_node", "connection_pool_deadlock"}:
+            zombie = 3
+            if zombie < len(sim.nodes):
+                n = sim.nodes[zombie]
+                if not n.is_failed and n.restart_countdown == 0 and n.role == "app_server":
+                    n.cpu_util = min(n.cpu_util, 0.08)
+                    sim.last_trace_p99_latency = max(sim.last_trace_p99_latency, 300.0)
+
+        # --- Memory leak slow burn: node 5 memory climbs regardless of load ---
+        if scenario == "memory_leak_slow_burn":
+            leak = 5
+            # Keep the rest of the system "apparently healthy" so the leak is the dominant signal.
+            for i, node in enumerate(sim.nodes):
+                if node.is_failed or node.restart_countdown > 0:
+                    continue
+                if node.role == "database":
+                    node.cpu_util = min(node.cpu_util, 0.65)
+                elif i != leak:
+                    node.cpu_util = min(node.cpu_util, 0.55)
+                    node.queue_length = min(node.queue_length, 25)
+
+            if leak < len(sim.nodes):
+                n = sim.nodes[leak]
+                if not n.is_failed and n.restart_countdown == 0:
+                    n.memory_util = min(1.0, n.memory_util + 0.02)
+                    n.cpu_util = min(max(0.05, n.cpu_util), 0.40)
+
+        # --- Split brain / IO bottleneck: DB io_wait spikes; scaling makes it worse ---
+        if scenario == "split_brain_io_bottleneck":
+            sim.last_trace_node_0_io = max(sim.last_trace_node_0_io, 0.85)
+            if sim.last_action_type == "scale_up" and sim.last_trace_node_0_io > 0.80:
+                # Connection pool exhaustion style shock
+                sim.action_errors.append(
+                    "CRITICAL: Scale-up during DB IO saturation caused connection pool exhaustion."
+                )
+                # Raise DB CPU sharply (lockup spiral)
+                if sim.nodes and sim.nodes[0].role == "database":
+                    sim.nodes[0].cpu_util = min(1.0, sim.nodes[0].cpu_util + 0.40)
+
+        # --- Black swan: correlated AZ failure at step 3 ---
+        if scenario == "black_swan_az_failure" and not sim._black_swan_applied:
+            if sim.step_count >= 3:
+                dead = [1, 2, 3, 4]
+                for idx in dead:
+                    if idx < len(sim.nodes):
+                        sim.nodes[idx].is_failed = True
+                sim.action_errors.append("CRITICAL: Availability Zone offline. Nodes 1-4 dead.")
+                for idx in [5, 6, 7]:
+                    if idx < len(sim.nodes) and not sim.nodes[idx].is_failed:
+                        sim.nodes[idx].cpu_util = max(sim.nodes[idx].cpu_util, 0.95)
+                # Give the DB a brief headroom bump to avoid immediate total collapse.
+                if sim.nodes and sim.nodes[0].role == "database":
+                    sim.nodes[0].cpu_util = min(sim.nodes[0].cpu_util, 0.75)
+                sim._black_swan_applied = True
