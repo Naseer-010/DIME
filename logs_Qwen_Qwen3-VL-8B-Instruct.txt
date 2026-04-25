@@ -1,0 +1,12 @@
+==================================================
+  STARTING DIME EVALUATION SESSION: Qwen/Qwen3-VL-8B-Instruct
+==================================================
+
+[START] task=traffic_spike env=distributed_infra_env model=Qwen/Qwen3-VL-8B-Instruct
+
+[INFO] Loading local model Qwen/Qwen3-VL-8B-Instruct via Transformers to GPU...
+config.json: 0.00B [00:00, ?B/s]config.json: 1.47kB [00:00, 2.62MB/s]
+tokenizer_config.json: 0.00B [00:00, ?B/s]tokenizer_config.json: 10.9kB [00:00, 24.5MB/s]
+vocab.json: 0.00B [00:00, ?B/s]vocab.json: 2.78MB [00:00, 13.9MB/s]vocab.json: 2.78MB [00:00, 13.8MB/s]
+merges.txt: 0.00B [00:00, ?B/s]merges.txt: 1.67MB [00:00, 10.2MB/s]merges.txt: 1.67MB [00:00, 10.2MB/s]
+tokenizer.json: 0.00B [00:00, ?B/s]tokenizer.json: 7.03MB [00:00, 15.3MB/s]tokenizer.json: 7.03MB [00:00, 15.3MB/s]
