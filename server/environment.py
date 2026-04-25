@@ -490,15 +490,23 @@ class DistributedInfraEnvironment(Environment):
         if sim.trace_replay is not None:
             trace_step = sim.trace_replay.get_step(sim.step_count)
             sim.current_request_rate = trace_step.request_rate
-            sim.last_trace_p99_latency = float(getattr(trace_step, "p99_latency", 0.0) or 0.0)
-            sim.last_trace_node_0_io = float(getattr(trace_step, "node_0_io", 0.0) or 0.0)
+            sim.last_trace_p99_latency = float(
+                getattr(trace_step, "p99_latency", 0.0) or 0.0
+            )
+            sim.last_trace_node_0_io = float(
+                getattr(trace_step, "node_0_io", 0.0) or 0.0
+            )
 
             # Scenario-specific caps so "named incidents" don't instantly devolve into pure overload.
             if scenario == "memory_leak_slow_burn":
                 sim.current_request_rate = min(sim.current_request_rate, 220.0)
             elif scenario == "black_swan_az_failure":
                 sim.current_request_rate = min(sim.current_request_rate, 260.0)
-            elif scenario in {"zombie_node", "connection_pool_deadlock", "hot_shard_skew"}:
+            elif scenario in {
+                "zombie_node",
+                "connection_pool_deadlock",
+                "hot_shard_skew",
+            }:
                 sim.current_request_rate = min(sim.current_request_rate, 280.0)
             # Inject per-node CPU baselines from trace
             for node_idx, cpu_val in trace_step.node_cpu.items():
@@ -606,7 +614,6 @@ class DistributedInfraEnvironment(Environment):
         for i, n in enumerate(sim.nodes):
             if n.role == "database" and not n.is_failed:
                 db_node = n
-                db_idx = i
                 break
 
         db_available = db_node is not None and db_node.restart_countdown == 0
@@ -743,37 +750,64 @@ class DistributedInfraEnvironment(Environment):
         if newly_failed:
             sim.cascade_occurred = True
             for idx in newly_failed:
+                # Zero out metrics immediately to prevent zombie state in
+                # observations.  The load captured here is forwarded to
+                # survivors inside _redistribute_from_node.
+                node = sim.nodes[idx]
+                node.cpu_util = 0.0
+                node.queue_length = 0
+                node.memory_util = 0.0
+
                 self._redistribute_from_node(idx)
                 # If DB fails, log a critical dependency event
-                if sim.nodes[idx].role == "database":
+                if node.role == "database":
                     sim.action_errors.append(
                         "CRITICAL: Database node failed — all app server "
                         "processing halted until DB is restarted."
                     )
 
     def _redistribute_from_node(self, idx: int) -> None:
-        """Redistribute a failed/removed node's load to its neighbors."""
+        """Redistribute a failed/removed node's load to its neighbors.
+
+        The caller is responsible for zeroing the source node's metrics
+        *before* calling this method (see ``_check_failures``).  For the
+        temp-node-expiry path in ``_tick_node_timers``, metrics are
+        captured before this call so the load can still be forwarded.
+        """
         sim = self._sim
         node = sim.nodes[idx]
+
+        # Capture whatever residual load remains (may already be zero if
+        # the caller cleared it, which is fine — we still attempt to
+        # distribute for the temp-node-expiry path).
+        load_to_move = node.cpu_util
+        queue_to_move = node.queue_length
+
+        # Zero out the dead node immediately (prevents zombie state even
+        # if called from a path that didn't pre-clear).
+        node.cpu_util = 0.0
+        node.queue_length = 0
+        node.memory_util = 0.0
+
+        # Find healthy neighbors
         neighbors = [
             n
             for n in sim.adjacency.get(idx, [])
             if n < len(sim.nodes) and not sim.nodes[n].is_failed
         ]
 
+        # If no neighbors survive, the load is simply dropped
+        # (cascading failure complete).
         if not neighbors:
             return
 
-        load_share = node.cpu_util / len(neighbors)
-        queue_share = node.queue_length // max(1, len(neighbors))
+        load_share = load_to_move / len(neighbors)
+        queue_share = queue_to_move // max(1, len(neighbors))
 
         for neighbor_idx in neighbors:
             neighbor = sim.nodes[neighbor_idx]
             neighbor.cpu_util = min(1.0, neighbor.cpu_util + load_share)
             neighbor.queue_length += queue_share
-
-        node.cpu_util = 0.0
-        node.queue_length = 0
 
     # ----- Reward computation (composable rubrics) -----
 
@@ -999,7 +1033,11 @@ class DistributedInfraEnvironment(Environment):
             zombie = 3
             if zombie < len(sim.nodes):
                 n = sim.nodes[zombie]
-                if not n.is_failed and n.restart_countdown == 0 and n.role == "app_server":
+                if (
+                    not n.is_failed
+                    and n.restart_countdown == 0
+                    and n.role == "app_server"
+                ):
                     n.cpu_util = min(n.cpu_util, 0.08)
                     sim.last_trace_p99_latency = max(sim.last_trace_p99_latency, 300.0)
 
@@ -1041,7 +1079,9 @@ class DistributedInfraEnvironment(Environment):
                 for idx in dead:
                     if idx < len(sim.nodes):
                         sim.nodes[idx].is_failed = True
-                sim.action_errors.append("CRITICAL: Availability Zone offline. Nodes 1-4 dead.")
+                sim.action_errors.append(
+                    "CRITICAL: Availability Zone offline. Nodes 1-4 dead."
+                )
                 for idx in [5, 6, 7]:
                     if idx < len(sim.nodes) and not sim.nodes[idx].is_failed:
                         sim.nodes[idx].cpu_util = max(sim.nodes[idx].cpu_util, 0.95)
