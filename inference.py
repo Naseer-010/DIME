@@ -67,6 +67,7 @@ BENCHMARK = "distributed_infra_env"
 _tokenizer = None
 _model = None
 _client = None
+_direct_env = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
@@ -641,6 +642,57 @@ def env_step(env_url: str, action: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Direct (in-process) environment access — used when --mode local so the HTTP
+# server does not need to be running separately.
+# ---------------------------------------------------------------------------
+def _get_direct_env():
+    global _direct_env
+    if _direct_env is None:
+        from server.environment import DistributedInfraEnvironment
+        _direct_env = DistributedInfraEnvironment()
+    return _direct_env
+
+
+def _infraobs_to_dict(obs) -> dict:
+    keys = [
+        "cpu_loads", "mem_utilizations", "queue_lengths", "failed_nodes",
+        "latency_ms", "request_rate", "io_wait", "p99_latency", "error_budget",
+        "step", "task_hint", "action_errors", "cloud_budget",
+        "task_score", "done", "reward", "uptime_pct",
+    ]
+    return {k: getattr(obs, k) for k in keys if hasattr(obs, k)}
+
+
+def env_reset_direct(task_id: str) -> dict:
+    return _infraobs_to_dict(_get_direct_env().reset(task=task_id))
+
+
+def env_step_direct(action_dict: dict) -> dict:
+    from server.models import InfraAction
+    env = _get_direct_env()
+    raw_cmd = action_dict.get("raw_command")
+    if raw_cmd and raw_cmd != "no_op":
+        action = InfraAction(action_type="no_op", raw_command=raw_cmd)
+    else:
+        act_type = action_dict.get("action_type", "no_op")
+        kwargs: dict = {"action_type": act_type}
+        if act_type in ("restart_node", "query_logs") and action_dict.get("target") is not None:
+            kwargs["target"] = int(action_dict["target"])
+        elif act_type == "reroute_traffic":
+            kwargs["from_node"] = int(action_dict.get("from_node", 0))
+            kwargs["to_node"] = int(action_dict.get("to_node", 0))
+        elif act_type == "throttle" and action_dict.get("rate") is not None:
+            kwargs["rate"] = float(action_dict["rate"])
+        try:
+            action = InfraAction(**kwargs)
+        except Exception:
+            action = InfraAction(action_type="no_op")
+    obs = env.step(action)
+    obs_dict = _infraobs_to_dict(obs)
+    return {"data": {"observation": obs_dict, "reward": getattr(obs, "reward", 0.0), "done": getattr(obs, "done", False)}}
+
+
+# ---------------------------------------------------------------------------
 # Task Runner
 # ---------------------------------------------------------------------------
 def run_task(
@@ -654,13 +706,14 @@ def run_task(
     csv_path: Path,
     structured_logger: StructuredLogger,
     max_episode_steps: int = 100,
+    use_direct: bool = False,
 ) -> dict:
     log_start(task=task_id, env=BENCHMARK, model=model_name, mode=mode)
     episode_path = structured_logger.start_episode(task_id)
     print(f"[INFO] Structured log: {episode_path}", flush=True)
 
     try:
-        obs = env_reset(env_url, task_id)
+        obs = env_reset_direct(task_id) if use_direct else env_reset(env_url, task_id)
     except Exception as e:
         print(
             f"[FATAL ERROR] Failed to connect to environment server for task '{task_id}': {e}",
@@ -711,7 +764,7 @@ def run_task(
         done = False
 
         try:
-            result = env_step(env_url, backend_action)
+            result = env_step_direct(backend_action) if use_direct else env_step(env_url, backend_action)
             data_block = result.get("data", result)
 
             if "observation" in data_block and isinstance(
@@ -870,6 +923,7 @@ def main():
         print(f"  STRUCTURED LOGS: {log_dir}")
         print("==================================================")
 
+        use_direct = (mode == "local")
         for task_id in tasks:
             stats = run_task(
                 task_id,
@@ -881,6 +935,7 @@ def main():
                 csv_path=csv_file,
                 structured_logger=structured_logger,
                 max_episode_steps=max_steps,
+                use_direct=use_direct,
             )
             all_task_stats.append(stats)
 
