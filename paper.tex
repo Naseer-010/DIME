@@ -74,8 +74,8 @@ We make the following contributions:
     benchmark with partial observability, error budget constraints, and
     Prometheus-style telemetry.
 
-    \item \textbf{Reward redesign}: we replace a gradient-annihilating $r = -1000$
-    hard cliff with a seven-component differentiable signal bounded to $[-5, +5]$, and
+    \item \textbf{Reward redesign}: we replace an early hard-cliff penalty (uniform
+    large negative reward on DB failure) with a seven-component differentiable signal bounded to $[-5, +5]$, and
     show that the original formulation would have made GRPO (or any policy gradient
     method) impossible to apply regardless of hyperparameter tuning.
 
@@ -203,20 +203,21 @@ the per-task score used in all tables below.
 
 \section{Reward Engineering and Failure Modes}
 
-\subsection{The $-1000$ Cliff: How It Blocked All Learning}
+\subsection{The Hard Cliff: How an Unbounded Penalty Blocked All Learning}
 
-The original \texttt{ProductionSREReward} in \texttt{server/rubrics.py} (pre-fix branch) returned:
+An early version of \texttt{ProductionSREReward} in \texttt{server/rubrics.py} returned
+a hard fixed penalty whenever the database node failed:
 
 \[
-r(s, a) = \begin{cases} -1000 & \text{if } 0 \in F(s) \\ -c_{\mathrm{db}} \exp(\lambda_{\mathrm{db}} \cdot c_0) + \cdots & \text{otherwise} \end{cases}
+r(s, a) = \begin{cases} r_{\min} & \text{if } 0 \in F(s) \\ -c_{\mathrm{db}} \exp(\lambda_{\mathrm{db}} \cdot c_0) + \cdots & \text{otherwise} \end{cases}
 \]
 
 with $c_{\mathrm{db}} = 100$, $\lambda_{\mathrm{db}} = 4.0$.
-At $c_0 \geq 0.57$ the second branch also evaluates to $\leq -1000$.
+At $c_0 \geq 0.57$ the second branch also evaluated to an extreme negative value.
 Because the environment's request simulator blends 60\% real trace data with 40\%
 stochastic simulation, DB CPU routinely crossed 0.57 within the first 1--3 steps of
-most episodes. Once node 0 crashed, every subsequent reward was $-1000$ regardless of
-action.
+most episodes. Once node 0 crashed, every subsequent reward was the same large
+negative constant regardless of action.
 
 This is not a hyperparameter problem --- it is a structural one. When all rewards
 within a GRPO group are equal, the advantage estimate is:
@@ -243,7 +244,7 @@ model.
   \includegraphics[width=\textwidth]{fig5_reward_cliff_bounded.png}
   \caption{%
     \textbf{Left:} Original reward function. At $c_0 \geq 0.57$ the signal
-    collapses to $-1000$, making all GRPO group advantages identically zero
+    collapses to a uniform large negative value, making all GRPO group advantages identically zero
     ($\hat{A}_i = 0/0$). The shaded region covers the majority of episode states
     in practice. \textbf{Right:} Redesigned reward bounded to $[-5,+5]$. Every
     point on the curve carries a non-zero gradient; the DB-failure penalty is
@@ -588,9 +589,9 @@ local direct environment access (no HTTP overhead), \texttt{enable\_thinking=Tru
 \texttt{max\_new\_tokens=4096}. Zero-shot baseline uses the unmodified
 \texttt{Qwen/Qwen3-8B} checkpoint. Fine-tuned evaluation uses \texttt{merged\_16bit}
 (LoRA merged into base weights, BF16). Every task except
-\texttt{memory\_leak\_slow\_burn} received a reward of $-1000$ at every step under the
-original rubric, making zero-shot evaluation uninformative under the old reward; all
-results use the fixed rubric.
+\texttt{memory\_leak\_slow\_burn} received a uniform large penalty at every step under the
+original hard-cliff rubric, making zero-shot evaluation uninformative; all
+results reported here use the fixed bounded rubric.
 
 \subsection{Ablations}
 
@@ -715,7 +716,7 @@ We report single-run results here due to time constraints but note this as an im
 We introduced DIME, fine-tuned Qwen3-8B via GRPO to act as an autonomous SRE agent,
 and achieved a +17.8 pp improvement over the zero-shot baseline in 44 minutes of
 training. More than the final numbers, we believe the documented failure modes are the
-primary contribution: the reward cliff that made policy gradient impossible, the
+primary contribution: the hard-cliff reward design that made policy gradient impossible, the
 thinking-token truncation that silently zeroed gradients, the oracle priority inversion
 that trained plausible-but-wrong behavior, and the reward coupling failure that
 recreated zero-variance advantages from a bounded signal. Each failure was diagnosed
