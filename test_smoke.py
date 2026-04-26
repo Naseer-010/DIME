@@ -322,27 +322,45 @@ def test_prometheus_metrics():
 
 
 def test_throughput_verifier():
-    """Verify ThroughputVerifier penalizes zero-service exploit."""
+    """Verify reward function penalizes throttle-to-zero exploit vs no_op."""
     print("\n--- Testing ThroughputVerifier ---")
-    env = DistributedInfraEnvironment()
-    env.reset(seed=42, task="traffic_spike")
+    from server.rubrics import ProductionSREReward
 
-    # Step normally first to get baseline reward
-    obs_normal = env.step(InfraAction(action_type="no_op"))
-    reward_normal = obs_normal.reward
-    print(f"  Normal reward (no_op): {reward_normal}")
+    engine = ProductionSREReward()
 
-    # Now set throttle to 0.0 (zero-service exploit)
-    obs_exploit = env.step(InfraAction(action_type="throttle", rate=0.0))
-    # Step again to see the penalty
-    obs_penalty = env.step(InfraAction(action_type="no_op"))
-    reward_exploit = obs_penalty.reward
-    print(f"  Exploit reward (throttle=0.0): {reward_exploit}")
+    # Healthy cluster state (no failures, moderate load)
+    state = {
+        "cpu_loads": [0.3, 0.4, 0.5, 0.3, 0.4, 0.3, 0.4, 0.3],
+        "mem_utilizations": [0.3, 0.35, 0.4, 0.3, 0.35, 0.3, 0.35, 0.3],
+        "queue_lengths": [5, 10, 8, 5, 7, 5, 8, 5],
+        "failed_nodes": [],
+        "latency_ms": 30.0,
+        "p99_latency": 40.0,
+        "error_budget": 100.0,
+    }
 
-    # The exploit reward should be significantly lower due to throughput penalty
-    assert reward_exploit < reward_normal, (
-        f"Exploit reward ({reward_exploit}) should be < normal ({reward_normal})"
+    # Normal no_op action
+    reward_normal = engine.calculate_reward(state, {"action_type": "no_op"})
+    print(f"  Normal reward (no_op, healthy): {reward_normal:.4f}")
+
+    # Throttle-to-zero exploit
+    reward_exploit = engine.calculate_reward(
+        state, {"action_type": "throttle", "rate": 0.0}
     )
+    print(f"  Exploit reward (throttle=0.0): {reward_exploit:.4f}")
+
+    # Throttle should have penalty (action tax + shed tax)
+    assert reward_exploit < reward_normal, (
+        f"Exploit reward ({reward_exploit:.4f}) should be < normal ({reward_normal:.4f}). "
+        f"The throttle/action tax should make exploit strictly worse."
+    )
+
+    # Also verify both are bounded
+    assert -5.0 <= reward_normal <= 5.0, f"Normal reward out of bounds: {reward_normal}"
+    assert -5.0 <= reward_exploit <= 5.0, (
+        f"Exploit reward out of bounds: {reward_exploit}"
+    )
+
     print("  Zero-service exploit correctly penalized!")
     print("  PASSED: throughput_verifier")
 
@@ -402,6 +420,198 @@ def test_db_dependency_cascade():
     print("  PASSED: db_dependency_cascade")
 
 
+# =====================================================================
+# Phase 3 Tests — RL Readiness Verification
+# =====================================================================
+
+
+def test_zombie_node_zeroed():
+    """Verify failed nodes with no healthy neighbors have metrics zeroed."""
+    print("\n--- Testing zombie node zeroed ---")
+    env = DistributedInfraEnvironment()
+    env.reset(seed=42, task="traffic_spike")
+
+    # Fail ALL nodes so that when a node fails, there are no healthy neighbors
+    for node in env.sim.nodes:
+        node.is_failed = True
+        node.cpu_util = 0.0
+        node.queue_length = 0
+
+    # Now un-fail one node, set it to high CPU, then let it fail
+    env.sim.nodes[3].is_failed = False
+    env.sim.nodes[3].cpu_util = 0.95
+    env.sim.nodes[3].queue_length = 50
+    env.sim.nodes[3].memory_util = 0.7
+    env.sim.nodes[3].high_cpu_streak = 3  # triggers failure
+
+    # Run failure check
+    env._check_failures()
+
+    # Node 3 should now be failed AND have zeroed metrics
+    assert env.sim.nodes[3].is_failed, "Node 3 should be failed"
+    assert env.sim.nodes[3].cpu_util == 0.0, (
+        f"Zombie bug: cpu_util={env.sim.nodes[3].cpu_util}, expected 0.0"
+    )
+    assert env.sim.nodes[3].queue_length == 0, (
+        f"Zombie bug: queue_length={env.sim.nodes[3].queue_length}, expected 0"
+    )
+    assert env.sim.nodes[3].memory_util == 0.0, (
+        f"Zombie bug: memory_util={env.sim.nodes[3].memory_util}, expected 0.0"
+    )
+    print("  Node 3 failed with zeroed metrics (no zombie state)")
+    print("  PASSED: zombie_node_zeroed")
+
+
+def test_reward_signal_variance():
+    """Verify rewards are NOT all identical (gradient health check)."""
+    print("\n--- Testing reward signal variance ---")
+    from server.rubrics import ProductionSREReward
+
+    engine = ProductionSREReward()
+
+    # Test: rewards should vary across different cluster states
+    states = [
+        {  # Healthy cluster
+            "cpu_loads": [0.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+            "mem_utilizations": [0.2, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3],
+            "queue_lengths": [2, 5, 5, 5, 5, 5, 5, 5],
+            "failed_nodes": [],
+            "latency_ms": 20.0,
+            "p99_latency": 30.0,
+            "error_budget": 100.0,
+        },
+        {  # Light stress (still manageable)
+            "cpu_loads": [0.35, 0.5, 0.45, 0.5, 0.45, 0.5, 0.45, 0.5],
+            "mem_utilizations": [0.3, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4, 0.4],
+            "queue_lengths": [5, 15, 10, 15, 10, 15, 10, 15],
+            "failed_nodes": [],
+            "latency_ms": 45.0,
+            "p99_latency": 48.0,
+            "error_budget": 90.0,
+        },
+        {  # Moderate stress
+            "cpu_loads": [0.5, 0.6, 0.55, 0.6, 0.55, 0.6, 0.55, 0.6],
+            "mem_utilizations": [0.4, 0.5, 0.45, 0.5, 0.45, 0.5, 0.45, 0.5],
+            "queue_lengths": [10, 30, 25, 30, 25, 30, 25, 30],
+            "failed_nodes": [],
+            "latency_ms": 60.0,
+            "p99_latency": 80.0,
+            "error_budget": 75.0,
+        },
+        {  # DB dead (catastrophic)
+            "cpu_loads": [0.0, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9],
+            "mem_utilizations": [0.0, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8, 0.8],
+            "queue_lengths": [0, 200, 200, 200, 200, 200, 200, 200],
+            "failed_nodes": [0],
+            "latency_ms": 500.0,
+            "p99_latency": 800.0,
+            "error_budget": 30.0,
+        },
+    ]
+
+    rewards = []
+    for i, state in enumerate(states):
+        r = engine.calculate_reward(state, {"action_type": "no_op"})
+        rewards.append(r)
+        print(f"  State {i} reward: {r:.4f}")
+
+    unique_rewards = set(round(r, 2) for r in rewards)
+    print(f"  Reward range: [{min(rewards):.2f}, {max(rewards):.2f}]")
+    print(f"  Unique reward values: {len(unique_rewards)}")
+
+    assert len(unique_rewards) >= 3, (
+        f"Insufficient reward variance: only {len(unique_rewards)} unique values. "
+        f"Need at least 3 for healthy RL gradients."
+    )
+
+    # Ensure all bounded
+    assert all(r >= -5.0 for r in rewards), (
+        f"Unbounded reward detected: {min(rewards):.2f}. Must be >= -5.0"
+    )
+    assert all(r <= 5.0 for r in rewards), (
+        f"Unbounded reward detected: {max(rewards):.2f}. Must be <= 5.0"
+    )
+
+    # Healthy should be strictly better than DB-dead
+    assert rewards[0] > rewards[-1], (
+        f"Healthy ({rewards[0]:.4f}) should reward more than DB-dead ({rewards[-1]:.4f})"
+    )
+
+    print("  Reward signal has healthy variance and monotonic degradation!")
+    print("  PASSED: reward_signal_variance")
+
+
+def test_reward_bounded():
+    """Verify reward is bounded even when DB fails."""
+    print("\n--- Testing reward bounded on DB failure ---")
+    env = DistributedInfraEnvironment()
+    env.reset(seed=42, task="traffic_spike")
+
+    # Force DB failure
+    env.sim.nodes[0].is_failed = True
+    env.sim.nodes[0].cpu_util = 0.0
+
+    obs = env.step(InfraAction(action_type="no_op"))
+    reward = obs.reward
+    print(f"  Reward after DB failure: {reward}")
+
+    assert reward >= -5.0, (
+        f"Reward too low: {reward}. Must be >= -5.0 (was -1000 before fix)."
+    )
+    assert reward <= 5.0, f"Reward too high: {reward}. Must be <= 5.0."
+
+    # Also test near-total collapse
+    for n in env.sim.nodes[1:6]:
+        n.is_failed = True
+    obs = env.step(InfraAction(action_type="no_op"))
+    reward2 = obs.reward
+    print(f"  Reward after near-total collapse: {reward2}")
+    assert -5.0 <= reward2 <= 5.0, f"Reward out of bounds: {reward2}"
+
+    print("  PASSED: reward_bounded")
+
+
+def test_node_prefix_parsing():
+    """Verify command parser handles 'node-' prefixed IDs from LLM output."""
+    print("\n--- Testing node- prefix parsing ---")
+    env = DistributedInfraEnvironment()
+    env.reset(seed=42, task="traffic_spike")
+
+    # Test: --from=node-5 --to=node-3 (common LLM hallucination)
+    obs = env.step(
+        InfraAction(
+            action_type="no_op",
+            raw_command="kubectl exec -it istio-proxy -- traffic shift --from=node-5 --to=node-3",
+        )
+    )
+    assert not any("ParseError" in e for e in obs.action_errors), (
+        f"node- prefix caused parse error: {obs.action_errors}"
+    )
+    print("  traffic shift --from=node-5 --to=node-3: parsed OK")
+
+    # Test: kubectl delete pod node-3 (should already work but verify)
+    obs = env.step(
+        InfraAction(
+            action_type="no_op",
+            raw_command="kubectl delete pod node-3",
+        )
+    )
+    assert not any("ParseError" in e for e in obs.action_errors)
+    print("  kubectl delete pod node-3: parsed OK")
+
+    # Test: kubectl logs node-2 (should work)
+    obs = env.step(
+        InfraAction(
+            action_type="no_op",
+            raw_command="kubectl logs node-2",
+        )
+    )
+    assert not any("ParseError" in e for e in obs.action_errors)
+    print("  kubectl logs node-2: parsed OK")
+
+    print("  PASSED: node_prefix_parsing")
+
+
 if __name__ == "__main__":
     # Phase 1 tasks
     for task in ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]:
@@ -422,5 +632,11 @@ if __name__ == "__main__":
     test_throughput_verifier()
     test_alibaba_trace_replay()
     test_db_dependency_cascade()
+
+    # Phase 3 — RL readiness tests
+    test_zombie_node_zeroed()
+    test_reward_signal_variance()
+    test_reward_bounded()
+    test_node_prefix_parsing()
 
     print("\n=== ALL SMOKE TESTS PASSED ===")

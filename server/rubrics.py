@@ -18,6 +18,8 @@ import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Protocol
 
+import numpy as np
+
 if TYPE_CHECKING:
     from server.environment import Node, SimulationState
 
@@ -255,3 +257,186 @@ def compute_composite_reward(
     total_clipped = max(-10.0, min(10.0, total))
 
     return round(total_clipped, 4), breakdown
+
+
+# ---------------------------------------------------------------------------
+# Production-grade SRE reward (used for RL training signal)
+# ---------------------------------------------------------------------------
+#
+# Design goals (GRPO / PPO compatibility):
+#   1.  Output bounded to roughly [-5.0, +5.0] so the advantage estimator
+#       has healthy variance.  No hardcoded -1000.0 cliffs.
+#   2.  Smooth, continuous penalties so policy gradients don't vanish.
+#   3.  Catastrophic states (DB dead, total collapse) receive a bounded
+#       maximum penalty (-5.0), not an infinite step-function drop.
+# ---------------------------------------------------------------------------
+
+
+class ProductionSREReward:
+    """Bounded, gradient-friendly SRE reward for Policy Gradient RL."""
+
+    def __init__(self):
+        # Asymmetric Topology Coefficients (bounded)
+        self.c_db = 1.5  # max ≈ 1.5 * e^(2*1.0) ≈ 11  → clipped later
+        self.lambda_db = 2.0  # softer exponent than original 4.0
+        self.c_worker = 0.05  # mild quadratic worker penalty
+
+        # Load Shedding Economics
+        self.b_max = 100.0
+        self.psi_shed = 0.3
+        self.delta_shed = 2.0
+
+        # Multi-Dimensional Stress
+        self.b_mem = 0.5  # scaled down from 5.0
+
+        # Temporal Friction Tracking
+        self.scale_cooldown_queue = 0.0
+
+    def reset(self) -> None:
+        self.scale_cooldown_queue = 0.0
+
+    def calculate_reward(self, state: dict, action: dict) -> float:
+        reward = 0.0
+
+        # --- 1. Asymmetric Topology (Heart vs. Pinky) ---
+        # DB failure is catastrophic but bounded
+        if 0 in state.get("failed_nodes", []):
+            return -5.0  # bounded terminal penalty, NOT -1000
+
+        db_cpu = float(state["cpu_loads"][0]) if state.get("cpu_loads") else 0.0
+        # Softer exponential: peaks at ~-11 for cpu=1.0, clipped below
+        r_topo = -self.c_db * np.exp(self.lambda_db * db_cpu)
+
+        # Quadratic Worker Penalty: Soft degradation
+        worker_cpus = state.get("cpu_loads", [0.0] * 8)[1:]
+        r_topo -= self.c_worker * sum(float(cpu) ** 2 for cpu in worker_cpus)
+        reward += float(r_topo)
+
+        # --- 2. Economics of Load Shedding (Error Budget) ---
+        error_budget = float(state.get("error_budget", self.b_max))
+        if action.get("action_type") == "throttle":
+            rate = float(action.get("rate", 1.0))
+            shed_amount = 1.0 - rate
+
+            budget_depletion_factor = (self.b_max / max(1.0, error_budget)) ** 2
+            r_shed = (
+                -self.psi_shed
+                * shed_amount
+                * (1.0 + self.delta_shed * budget_depletion_factor)
+            )
+            reward += float(r_shed)
+
+        # --- 3. Multi-Dimensional Stress (CPU Slope vs Mem Cliff) ---
+        mem_usages = state.get("mem_utilizations", [0.4] * 8)
+        r_mem = 0.0
+        for mem in mem_usages:
+            mem = float(mem)
+            if mem >= 0.98:
+                r_mem -= 2.0  # OOM bounded penalty per node, NOT -500
+            elif mem > 0.5:
+                # Smooth exponential with cap to prevent overflow
+                exponent = min(10.0, 1.0 / max(0.02, 1.0 - mem))
+                r_mem -= min(1.5, self.b_mem * np.exp(exponent - 2.0))
+        reward += float(r_mem)
+
+        # --- 4. Temporal Friction (Cold Start Integral) ---
+        if action.get("action_type") == "scale_up":
+            self.scale_cooldown_queue += 3 * sum(state.get("queue_lengths", [10]))
+
+        if self.scale_cooldown_queue > 0:
+            # Capped contribution
+            reward -= min(1.0, 0.01 * self.scale_cooldown_queue)
+            self.scale_cooldown_queue = max(
+                0.0,
+                self.scale_cooldown_queue - sum(state.get("queue_lengths", [10])),
+            )
+
+        # --- 5. Tail Latency (p99) ---
+        p99 = float(state.get("p99_latency", float(state.get("latency_ms", 0.0)) * 1.5))
+        if p99 > 50.0:
+            # Quadratic penalty capped at -3.0
+            excess = (p99 - 50.0) / 200.0
+            reward -= min(3.0, 1.5 * (excess**2))
+
+        # --- 6. Uptime bonus (dense positive signal) ---
+        total_nodes = max(len(state.get("cpu_loads", [])), 1)
+        failed_count = len(state.get("failed_nodes", []))
+        uptime_ratio = (total_nodes - failed_count) / total_nodes
+        reward += uptime_ratio * 1.0  # +1.0 for 100% uptime
+
+        # --- 7. Action efficiency (anti-spam) ---
+        action_type = str(action.get("action_type", "no_op"))
+        if action_type != "no_op":
+            reward -= 0.05  # slight tax on taking action
+            if action_type == "throttle":
+                reward -= 0.10  # extra tax on throttling
+
+        return float(np.clip(reward, -5.0, 5.0))
+
+
+_SRE_ENGINE: ProductionSREReward | None = None
+_SRE_ENGINE_EPISODE: str | None = None
+
+
+def _get_sre_engine(sim: "SimulationState") -> ProductionSREReward:
+    global _SRE_ENGINE, _SRE_ENGINE_EPISODE
+    if _SRE_ENGINE is None:
+        _SRE_ENGINE = ProductionSREReward()
+        _SRE_ENGINE_EPISODE = None
+
+    eid = getattr(sim, "episode_id", None)
+    if eid is not None and eid != _SRE_ENGINE_EPISODE:
+        _SRE_ENGINE.reset()
+        _SRE_ENGINE_EPISODE = eid
+    return _SRE_ENGINE
+
+
+def build_production_state(sim: "SimulationState") -> dict:
+    cpu_loads = [float(n.cpu_util) for n in sim.nodes]
+    mem_utils = [float(getattr(n, "memory_util", 0.0)) for n in sim.nodes]
+    queue_lengths = [int(getattr(n, "queue_length", 0)) for n in sim.nodes]
+    failed = [i for i, n in enumerate(sim.nodes) if getattr(n, "is_failed", False)]
+
+    return {
+        "cpu_loads": cpu_loads,
+        "mem_utilizations": mem_utils,
+        "queue_lengths": queue_lengths,
+        "failed_nodes": failed,
+        "latency_ms": float(getattr(sim, "latency_ms", 0.0)),
+        "p99_latency": float(getattr(sim, "last_trace_p99_latency", 0.0)),
+        "io_wait": float(getattr(sim, "last_trace_node_0_io", 0.0)),
+        "error_budget": float(getattr(sim, "error_budget", 100.0)),
+    }
+
+
+def build_production_action(sim: "SimulationState") -> dict:
+    act = str(getattr(sim, "last_action_type", "no_op") or "no_op")
+    action: dict = {"action_type": act}
+    if act == "throttle":
+        action["rate"] = float(getattr(sim, "throttle_rate", 1.0))
+    return action
+
+
+def calculate_step_reward(sim: "SimulationState", is_dead: bool = False) -> float:
+    """
+    Training reward wrapper for production-grade SRE math.
+
+    Returns a bounded scalar in [-5.0, +5.0].  Catastrophic states (DB dead,
+    total collapse) return -5.0 — large enough to dominate the advantage but
+    small enough to preserve gradient health.
+    """
+    state = build_production_state(sim)
+
+    # Bounded terminal penalty for catastrophic states
+    if is_dead or 0 in state.get("failed_nodes", []):
+        return -5.0
+
+    # Bounded terminal penalty for near-total collapse
+    total = max(len(state.get("cpu_loads", [])), 1)
+    failed_ratio = len(state.get("failed_nodes", [])) / total
+    if failed_ratio >= 0.8:
+        return -4.0
+
+    engine = _get_sre_engine(sim)
+    action = build_production_action(sim)
+    return float(engine.calculate_reward(state, action))

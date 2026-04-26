@@ -17,7 +17,7 @@ import os
 import random
 
 NUM_NODES = 8
-NUM_STEPS = 500
+NUM_STEPS = 10000
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "traces")
 OUTPUT_FILE = os.path.join(OUTPUT_DIR, "alibaba_v2021_8node_500steps.csv")
 

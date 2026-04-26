@@ -371,3 +371,9 @@ websockets==16.0
     #   openenv-core
 zipp==3.23.1
     # via importlib-metadata
+
+
+# Append to requirements.txt
+torch>=2.1.0
+transformers>=4.43.0
+accelerate>=0.33.0

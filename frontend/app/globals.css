@@ -1,0 +1,108 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0a0a0a;
+  --foreground: #ededed;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+html {
+  scroll-behavior: smooth;
+  scroll-padding-top: 7rem;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+body {
+  background:
+    radial-gradient(circle at 16% -8%, rgba(251, 146, 60, 0.12), transparent 34%),
+    radial-gradient(circle at 84% 6%, rgba(251, 191, 36, 0.08), transparent 32%),
+    var(--background);
+  color: var(--foreground);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+html::-webkit-scrollbar,
+body::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}
+
+.landing-section {
+  padding: clamp(3rem, 6vw, 4rem) 0;
+}
+
+.section-inner {
+  margin: 0 auto;
+  max-width: 1100px;
+  padding: 0 40px;
+}
+
+@media (max-width: 768px) {
+  .landing-section {
+    padding: clamp(2.5rem, 7vw, 3rem) 0;
+  }
+
+  .section-inner {
+    padding: 0 24px;
+  }
+}
+
+.hero-nav-scroll {
+  -webkit-mask-image: linear-gradient(to right, transparent 0, black 18px, black calc(100% - 18px), transparent 100%);
+  mask-image: linear-gradient(to right, transparent 0, black 18px, black calc(100% - 18px), transparent 100%);
+}
+
+@keyframes heroBeamDrift {
+  0% {
+    transform: translateY(-6%);
+    opacity: 0.05;
+  }
+  20% {
+    opacity: 0.2;
+  }
+  54% {
+    opacity: 0.35;
+  }
+  82% {
+    opacity: 0.14;
+  }
+  100% {
+    transform: translateY(18%);
+    opacity: 0;
+  }
+}
+
+@keyframes heroSparklePulse {
+  0%,
+  100% {
+    opacity: 0.05;
+    transform: scale(0.85);
+  }
+  40% {
+    opacity: 0.1;
+  }
+  65% {
+    opacity: 0.48;
+    transform: scale(1);
+  }
+  82% {
+    opacity: 0.2;
+    transform: scale(0.92);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+}

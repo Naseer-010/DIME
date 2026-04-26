@@ -9,12 +9,31 @@ venv/
 .venv/
 *.env
 .env
-outputs/
+.DS_Store
+
+# Training artifacts and caches
+checkpoints/
+grpo_trainer_lora_model/
+unsloth_compiled_cache/
+*.tar
+*.tar.gz
+
+# Logs and metrics
 logs/
 *.log
-.DS_Store
+
+# Test artifacts
+test_venv/
+.pytest_cache/
+
+# OpenEnv / legacy
 OpenEnv/
 distributed_infra_env/
-pre_validate.sh
-test_venv/
-venv/
+outputs/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+*.png
+*.jpg
+*.pdf
