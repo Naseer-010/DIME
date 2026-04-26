@@ -1,0 +1,796 @@
+\documentclass{article}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{geometry}
+\geometry{margin=1in}
+\usepackage{float}
+\usepackage{subcaption}
+
+\title{DIME - Distributed Infrastructure Management Environment}
+\author{Naseer Hussain \and Shivangi Sharma \and Nithish Sri Ram}
+\date{April 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+We introduce DIME (Distributed Infrastructure Management Environment), a simulated
+8-node Kubernetes cluster in which a language model acts as an autonomous
+site-reliability engineer. The agent observes per-node CPU, memory, queue depth, and
+tail-latency telemetry at each timestep and must issue a single management command.
+We apply Group Relative Policy Optimization (GRPO) to Qwen3-8B with a four-component
+composite reward combining structural compliance, syntactic validity, physics-based
+environment feedback, and a deterministic triage oracle. We document several failure
+modes encountered during development --- including a reward cliff that caused
+zero-variance advantages and complete training collapse, a priority inversion in the
+reference policy that caused the model to learn a plausible but suboptimal behavior,
+and a generation length truncation issue that silently suppressed all learning signal ---
+and show how each was diagnosed and corrected. After 44 minutes of fine-tuning on a
+single A100-SXM4-80GB, the model improves from a zero-shot average of 0.3946 to 0.4649
+across 14 failure-scenario tasks (+17.8 pp, +44.8\% relative). We release the
+environment, training code, and fine-tuned model checkpoint to support future work on
+RL-trained infrastructure agents.
+\end{abstract}
+
+\section{Introduction}
+
+Autonomous management of distributed infrastructure is among the most operationally
+demanding tasks an AI agent can face. Unlike text generation or code synthesis, the
+SRE setting imposes hard real-time constraints: structured, parseable output on every
+step; action budgets that deplete permanently; cascading failure dynamics that amplify
+early mistakes; and partial observability when node telemetry drops out. Errors do not
+produce a wrong answer in a response --- they take down a production database.
+
+Recent work has demonstrated that LLMs can act as useful tools in cloud operations
+contexts. RCAgent [Wang et al., 2024] augments LLMs with tool-calling for root cause
+analysis in Alibaba Cloud's production systems. AIOpsLab [Chen et al., 2025], a
+framework from Microsoft Research presented at MLSys'25, provides a holistic evaluation
+harness for AI agents in cloud operations across fault injection, metric analysis, and
+remediation tasks. KubeIntellect [Seyedkazemi Ardebili \& Bartolini, 2025] achieves
+93\% tool-synthesis success on natural-language Kubernetes queries through a modular
+LLM orchestration architecture. However, these systems either rely on prompting or tool
+augmentation without policy optimization, or evaluate on single-turn query answering
+rather than multi-step episode control. Fine-tuning an LLM's weights to act as a
+closed-loop controller in a simulated infrastructure environment --- and documenting
+what breaks along the way --- is the focus of this paper.
+
+The broader landscape of LLM agent benchmarks (WebArena [Zhou et al., 2023], SWE-bench
+[Jimenez et al., 2024], ALFWorld [Shridhar et al., 2021]) has established that zero-shot
+performance of capable frontier models is a reasonable baseline; we adopt the same
+before/after evaluation methodology. What sets the infrastructure domain apart from web
+navigation or code editing is the \textit{continuous control} nature of the task: the
+agent must maintain system health across dozens of sequential decisions, and a single
+mis-prioritized action (throttle instead of restart) can lock an episode into a
+suboptimal attractor state.
+
+We make the following contributions:
+
+\begin{enumerate}
+    \item \textbf{DIME}: a configurable, reproducible 14-task Kubernetes simulation
+    benchmark with partial observability, error budget constraints, and
+    Prometheus-style telemetry.
+
+    \item \textbf{Reward redesign}: we replace a gradient-annihilating $r = -1000$
+    hard cliff with a seven-component differentiable signal bounded to $[-5, +5]$, and
+    show that the original formulation would have made GRPO (or any policy gradient
+    method) impossible to apply regardless of hyperparameter tuning.
+
+    \item \textbf{Oracle priority analysis}: we identify and correct a priority
+    inversion in the reference triage policy that caused the model to learn
+    \texttt{throttle} in database-failure states rather than \texttt{restart\_node(0)},
+    and quantify the downstream impact (+0.044 benchmark score).
+
+    \item \textbf{Failure documentation}: we describe five training configurations that
+    failed before convergence, each diagnosable from standard TRL metrics, providing a
+    practical troubleshooting guide for GRPO on environment-coupled reward functions.
+
+    \item A \textbf{public model checkpoint} at
+    \texttt{Naseer-010/Qwen3-8B-Finetuned-DIME} on the Hugging Face Hub.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{LLM agents for cloud and infrastructure operations.} RCAgent [Wang et al.,
+2024] demonstrates LLM-driven root cause analysis in a production Alibaba Cloud
+environment, using tool-calling rather than weight updates. AIOpsLab [Chen et al.,
+2025] is the closest antecedent to DIME: it provides a systematic evaluation framework
+for AI agents in cloud incident management, covering detection, diagnosis, and
+mitigation. Our work differs in that we \textit{fine-tune} the model's weights via
+GRPO rather than prompting, and focus on the episodic closed-loop control problem.
+Concurrent work on autonomous resource management in microservice systems [Zou et al.,
+2025] uses tabular RL (PPO) on environment simulators; we target an LLM policy directly.
+
+\textbf{RL fine-tuning of language models.} GRPO [Shao et al., 2024], introduced in
+the DeepSeekMath paper, eliminates the need for a separate value network by using
+group-internal advantage normalization. PPO [Schulman et al., 2017] is the dominant
+prior approach but requires a critic network that doubles memory usage and training time
+at LLM scale. We choose GRPO specifically because the CPU-bound reward evaluation (each
+step requires a full environment simulation) makes small batch sizes necessary, and the
+absence of a critic is a meaningful practical advantage.
+
+\textbf{ReAct and reasoning-action integration.} ReAct [Yao et al., 2023] established
+the pattern of interleaving natural language reasoning with action emission that we adopt
+in our output format. Our \texttt{<reasoning>...</reasoning><action>...</action>}
+scaffold follows this paradigm and is reinforced by the format reward component.
+
+\textbf{Parameter-efficient fine-tuning.} We use LoRA [Hu et al., 2022] to limit the
+trainable parameter count to 1.05\% of total weights (349 MB vs.\ 16 GB base model),
+making the fine-tuned checkpoint cheap to distribute and easy to swap over the base
+model.
+
+\section{The DIME Environment}
+
+\subsection{Cluster Model}
+
+DIME simulates an 8-node cluster. Node 0 is a stateful PostgreSQL-style database and
+acts as a single point of failure (SPOF). Nodes 1--7 are stateless application workers.
+At each step $t$ the agent receives observation
+
+\[
+s_t = \bigl(\mathbf{c} \in [-1,1]^8,\; \mathbf{m} \in [0,1]^8,\; \mathbf{q} \in \mathbb{Z}_{\geq 0}^8,\; F \subseteq \{0,\ldots,7\},\; \lambda,\; \lambda_{99},\; w_{\mathrm{io}},\; B,\; t\bigr)
+\]
+
+where $\mathbf{c}$ are per-node CPU utilizations ($c_i = -1$ denotes telemetry dropout),
+$\mathbf{m}$ are memory utilizations, $\mathbf{q}$ are pending request queue depths,
+$F$ is the set of failed node indices, $\lambda$ is mean latency (ms), $\lambda_{99}$
+is P99 tail latency, $w_{\mathrm{io}} \in [0,1]$ is a DB disk I/O saturation proxy,
+and $B \in \mathbb{Z}_{\geq 0}$ is the remaining error budget for load-shedding actions.
+
+\subsection{Action Space}
+
+The agent emits one action per step from six types:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Action} & \textbf{Effect} & \textbf{Constraint} \\
+\midrule
+\texttt{restart\_node($i$)} & Restores failed node $i$ & 2-step boot delay; 5-step cooldown \\
+\texttt{reroute($i \to j$)} & Shifts load fraction from $i$ to $j$ & Both nodes must be alive \\
+\texttt{scale\_up} & Adds a capacity node for 10 steps & Costs one budget unit \\
+\texttt{throttle($r$)} & Sets ingress acceptance rate $r \in [0,1]$ & Burns error budget \\
+\texttt{query\_logs($i$)} & Resolves telemetry dropout on node $i$ & --- \\
+\texttt{no\_op} & Passive observation & --- \\
+\bottomrule
+\end{tabular}
+\caption{Action space of the DIME environment.}
+\end{table}
+
+Actions are expressed as natural-language kubectl strings (e.g.,
+\texttt{kubectl delete pod node-3}), which DIME parses into the structured action types
+above. Malformed commands receive a \texttt{ParseError} penalty but do not crash the
+episode.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig9_architecture.png}
+  \caption{%
+    DIME cluster architecture and agent loop. Node-0 (red, PostgreSQL DB) is the
+    single point of failure; nodes 1--7 are stateless workers. At each step the LLM
+    agent receives observation $s_t$ from the environment and emits action $a_t$ as a
+    natural-language \texttt{kubectl} string. The composite reward $R(a_t, s_t)$ is
+    computed internally and used only during training.
+  }
+  \label{fig:architecture}
+\end{figure}
+
+\subsection{Request Simulation}
+
+Requests are simulated as a blend of 60\% real production trace data (Alibaba cluster
+trace v2018) and 40\% stochastic simulation, mixed per step. This blend gives DIME
+realistic burst patterns while maintaining episode-to-episode variability. The
+stochastic component means per-task scores vary across runs even with a fixed model; we
+discuss the implications for evaluation in Section~8.3.
+
+\subsection{Benchmark Tasks}
+
+DIME defines 14 canonical failure scenarios:
+\texttt{traffic\_spike}, \texttt{node\_failure}, \texttt{cascading\_failure},
+\texttt{flash\_crowd}, \texttt{level\_5\_alibaba\_trace}, \texttt{thundering\_herd},
+\texttt{zombie\_node}, \texttt{memory\_leak\_slow\_burn},
+\texttt{split\_brain\_io\_bottleneck}, \texttt{black\_swan\_az\_failure},
+\texttt{retry\_storm}, \texttt{hot\_shard\_skew},
+\texttt{connection\_pool\_deadlock}, \texttt{autoscaler\_flapping\_trap}.
+
+Each task runs for up to 100 steps. Task score is reported as a running grader value
+$\tau_t \in (0, 1]$ computed by the environment's rubric engine; the final $\tau_T$ is
+the per-task score used in all tables below.
+
+\section{Reward Engineering and Failure Modes}
+
+\subsection{The $-1000$ Cliff: How It Blocked All Learning}
+
+The original \texttt{ProductionSREReward} in \texttt{server/rubrics.py} (pre-fix branch) returned:
+
+\[
+r(s, a) = \begin{cases} -1000 & \text{if } 0 \in F(s) \\ -c_{\mathrm{db}} \exp(\lambda_{\mathrm{db}} \cdot c_0) + \cdots & \text{otherwise} \end{cases}
+\]
+
+with $c_{\mathrm{db}} = 100$, $\lambda_{\mathrm{db}} = 4.0$.
+At $c_0 \geq 0.57$ the second branch also evaluates to $\leq -1000$.
+Because the environment's request simulator blends 60\% real trace data with 40\%
+stochastic simulation, DB CPU routinely crossed 0.57 within the first 1--3 steps of
+most episodes. Once node 0 crashed, every subsequent reward was $-1000$ regardless of
+action.
+
+This is not a hyperparameter problem --- it is a structural one. When all rewards
+within a GRPO group are equal, the advantage estimate is:
+
+\[
+\hat{A}_i = \frac{r_i - \bar{r}}{\sigma_r + \epsilon} = \frac{0}{\epsilon} \approx 0
+\]
+
+No gradient flows regardless of learning rate, KL coefficient, or batch size. We
+confirmed this empirically: \texttt{frac\_reward\_zero\_std = 1.0} from step 1,
+\texttt{train\_loss} $\approx 0$ throughout. The same pathology would affect PPO
+(value loss would fit to a constant), DPO (all preference pairs would tie), or any
+policy gradient variant.
+
+The only task that escaped was \texttt{memory\_leak\_slow\_burn} (zero-shot score
+0.99): memory leaks build slowly enough that the cliff was rarely triggered, giving the
+model 58 of 60 steps with informative gradients. This single outlier, where the
+zero-shot model already achieved near-perfect performance, was the evidence that the
+model had latent SRE capability --- the reward function was the bottleneck, not the
+model.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig5_reward_cliff_bounded.png}
+  \caption{%
+    \textbf{Left:} Original reward function. At $c_0 \geq 0.57$ the signal
+    collapses to $-1000$, making all GRPO group advantages identically zero
+    ($\hat{A}_i = 0/0$). The shaded region covers the majority of episode states
+    in practice. \textbf{Right:} Redesigned reward bounded to $[-5,+5]$. Every
+    point on the curve carries a non-zero gradient; the DB-failure penalty is
+    $-5$ (finite and distinguishable from all other states).
+  }
+  \label{fig:reward-cliff}
+\end{figure}
+
+\subsection{Fixed Environment Reward $R_{\mathrm{env}}$}
+
+The fixed \texttt{ProductionSREReward} replaces the cliff with seven differentiable components:
+
+\[
+R_{\mathrm{env}}(s, a) = \mathrm{clip}\!\left(\, r_{\mathrm{topo}} + r_{\mathrm{shed}} + r_{\mathrm{mem}} + r_{\mathrm{fric}} + r_{\mathrm{lat}} + r_{\mathrm{up}} + r_{\mathrm{eff}},\; -5,\; +5 \right)
+\]
+
+\textbf{Asymmetric topology term} (DB health):
+
+\[
+r_{\mathrm{topo}}(s) = \begin{cases}
+-5.0 & \text{if } 0 \in F(s) \\
+-c_{\mathrm{db}} \exp(\lambda_{\mathrm{db}} \cdot c_0) - c_w \displaystyle\sum_{i=1}^{7} c_i^2 & \text{otherwise}
+\end{cases}
+\]
+
+with $c_{\mathrm{db}} = 1.5$, $\lambda_{\mathrm{db}} = 2.0$, $c_w = 0.05$.
+At full DB load ($c_0 = 1.0$), $r_{\mathrm{topo}} \approx -11.1$, which is clipped by
+the outer bound --- the key change from the original, where the equivalent value was
+$-22026$.
+
+\textbf{Load-shedding economics:}
+
+\[
+r_{\mathrm{shed}}(s, a) = \begin{cases}
+-\psi_{\mathrm{shed}} (1 - r_{\mathrm{rate}}) \left(1 + \delta_{\mathrm{shed}} \left(\tfrac{B_{\max}}{B}\right)^2\right) & \text{if } a = \texttt{throttle}(r_{\mathrm{rate}}) \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+with $\psi_{\mathrm{shed}} = 0.3$, $\delta_{\mathrm{shed}} = 2.0$, $B_{\max} = 100$.
+This makes throttling increasingly expensive as the error budget depletes, incentivising
+the agent to reserve load-shedding for genuine emergencies.
+
+\textbf{Memory cliff:}
+
+\[
+r_{\mathrm{mem}}(s) = \sum_{i=0}^{7} \begin{cases}
+-2.0 & \text{if } m_i \geq 0.98 \\
+-\min\!\left(1.5,\; b_{\mathrm{mem}} \exp\!\left(\min\!\left(10, \tfrac{1}{1-m_i}\right) - 2\right)\right) & \text{if } m_i > 0.5
+\end{cases}
+\]
+
+with $b_{\mathrm{mem}} = 0.5$.
+
+\textbf{Tail-latency penalty:}
+
+\[
+r_{\mathrm{lat}}(s) = -\min\!\left(3.0,\; 1.5 \left(\frac{\max(0,\, \lambda_{99} - 50)}{200}\right)^2\right)
+\]
+
+\textbf{Uptime bonus} (dense positive signal):
+
+\[
+r_{\mathrm{up}}(s) = \frac{8 - |F(s)|}{8}
+\]
+
+\textbf{Action efficiency} (anti-spam):
+
+\[
+r_{\mathrm{eff}}(a) = \begin{cases}
+-0.15 & \text{if } a = \texttt{throttle}(\cdot) \\
+-0.05 & \text{if } a \neq \texttt{no\_op} \\
+0 & \text{otherwise}
+\end{cases}
+\]
+
+\textbf{Temporal friction} (cold-start penalty for \texttt{scale\_up}): a running
+integral that decays as queue lengths drain, bounded to $[-1, 0]$.
+
+\subsection{Composite Reward}
+
+The full training reward is a sum of four components:
+
+\[
+R(a, s) = \underbrace{R_{\mathrm{fmt}}(a)}_{\in[-3,+3]} + \underbrace{R_{\mathrm{val}}(a)}_{\in[-2,+2]} + \underbrace{R_{\mathrm{env}}(a, s)}_{\in[-5,+5]} + \underbrace{R_{\mathrm{tri}}(a, s)}_{\in[-0.5,+1]}
+\]
+
+\textbf{Format reward} $R_{\mathrm{fmt}} \in [-3, +3]$: rewards correct XML scaffold
+(\texttt{<reasoning>...</reasoning><action>...</action>}).
+
+\[
+R_{\mathrm{fmt}}(a) = \begin{cases}
++3.0 & \text{exactly one of each tag present} \\
+\sum_{\text{tag}} (+0.5 \cdot \mathbf{1}_{\text{correct}} - 1.0 \cdot \mathbf{1}_{\text{missing/dup}}) & \text{otherwise}
+\end{cases}
+\]
+
+\textbf{Validity reward} $R_{\mathrm{val}} \in [-2, +2]$: rewards syntactically
+parseable commands.
+
+\[
+R_{\mathrm{val}}(a) = \begin{cases}
++2.0 & \text{command parses without error} \\
++1.0 & a = \texttt{no\_op} \\
+-1.0 & \text{JSON present but parse fails} \\
+-2.0 & \text{no action block}
+\end{cases}
+\]
+
+\textbf{Environment reward} $R_{\mathrm{env}} \in [-5, +5]$: ProductionSREReward as above.
+
+\textbf{Triage oracle reward} $R_{\mathrm{tri}} \in [-0.5, +1]$: compares the agent's
+action against a deterministic reference policy $a^*(s)$ (Section~3.4). Kept
+intentionally weak so $R_{\mathrm{env}}$ (physics) dominates learning.
+
+\[
+R_{\mathrm{tri}}(a, s) = \begin{cases}
++1.0 & a = a^*(s) \\
++0.5 & \text{same action type, different parameters} \\
+0.0  & a = \texttt{no\_op},\; a^*(s) \neq \texttt{no\_op},\; \text{or system healthy} \\
+-0.5 & \text{otherwise}
+\end{cases}
+\]
+
+Total range: $R \in [-10.5, +11]$.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig10_reward_deepdive.png}
+  \caption{%
+    \textbf{Left:} Per-component reward breakdown over a 50-step
+    \texttt{connection\_pool\_deadlock} episode. $R_{\mathrm{fmt}}$ and
+    $R_{\mathrm{val}}$ stabilise immediately (blue/purple); $R_{\mathrm{env}}$
+    (teal) recovers after the agent throttles at step 2, driving the total reward
+    (green) upward to a final score of 0.9762. \textbf{Right:} Normalised
+    capability radar comparing zero-shot (gray) and fine-tuned (green) across six
+    sub-metrics. DB Recovery and Multi-Node Triage show the largest gains.
+  }
+  \label{fig:reward-components}
+\end{figure}
+
+\subsection{Triage Oracle $a^*(s)$}
+
+The reference policy is a priority-ordered decision tree evaluated on each state $s$:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{clll}
+\toprule
+\textbf{Priority} & \textbf{Condition} & \textbf{$a^*(s)$} & \textbf{Rationale} \\
+\midrule
+1 & $\exists i: m_i > 0.92$ & \texttt{restart\_node($i$)} & OOM prevention \\
+2 & $0 \in F(s)$ & \texttt{restart\_node(0)} & DB is SPOF \\
+3 & $w_{\mathrm{io}} > 0.80$ & \texttt{throttle(0.5)} & split-brain \\
+4 & $\exists i \geq 1: c_i > 0.90,\; \bar{c} < 0.60$ & \texttt{reroute($i \to \arg\min c$)} & hot shard \\
+5 & $\lambda_{99} > 100$ and $\mathrm{rr} > 150$ & \texttt{throttle(0.4)} & retry storm \\
+6 & $\exists i \geq 1: c_i \in [0, 0.10)$ and $\lambda_{99} > 100$ & \texttt{reroute($i \to \cdot$)} & zombie node \\
+7 & $|F(s)| \geq 2$ & \texttt{throttle(0.3)} & black swan \\
+8 & $c_0 > 0.80$ & \texttt{throttle(0.7)} & protect living DB \\
+9 & $\bar{c}_{\mathrm{workers}} > 0.75$ and $B > 20$ & \texttt{scale\_up} & safe scaling \\
+10 & --- & \texttt{no\_op} & --- \\
+\bottomrule
+\end{tabular}
+\caption{Triage oracle priority table.}
+\end{table}
+
+\textbf{The priority inversion.} In an earlier version of the oracle, Rule 7 (Black
+Swan: $|F(s)| \geq 2$) was evaluated \textit{before} Rule 2 (DB Recovery: $0 \in
+F(s)$). When both conditions held simultaneously --- multiple nodes including node 0
+failed --- the oracle prescribed \texttt{throttle(0.3)} rather than
+\texttt{restart\_node(0)}. Throttling when the database is dead does not restart the
+database; it merely reduces load onto a cluster that cannot serve requests regardless.
+
+A model trained under this inverted oracle learned the \texttt{throttle} response in
+DB-failure states with high consistency. The behavior is \textit{locally plausible} ---
+it is the right response for multi-node failures when the DB is alive --- but globally
+wrong when the DB is the failed node. This is a concrete case of reward hacking via
+reference policy defect: the model faithfully optimized the oracle rather than the
+environment, and the oracle was wrong. Correcting the priority (putting Rule 2 before
+Rule 7) was the sole change between training Run 4 (0.4206) and Run 6 (0.4649), a
++0.044 improvement.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\textwidth]{fig11_triage_tree.png}
+  \caption{%
+    Triage oracle decision tree (10 rules, priority order top-to-bottom).
+    The \textcolor{red}{red zone} marks the original priority inversion: Rule 7
+    (Black Swan) was evaluated before Rule 2 (DB Recovery), causing the model to
+    learn \texttt{throttle} in DB-failure states. Correcting the order produced
+    the sole change between Run 4 (0.4206) and Run 6 (0.4649).
+  }
+  \label{fig:triage-tree}
+\end{figure}
+
+\section{Method}
+
+\subsection{Dataset Collection}
+
+We collect a supervised dataset of (prompt, oracle-action) pairs by rolling out the
+environment for 500 episodes: 70\% driven by $a^*(s)$ (oracle), 30\% by uniform random
+actions (for diversity). Each state $s_t$ is serialized to JSON and embedded in a
+structured prompt that includes system context, current telemetry, and a 10-rule triage decision tree as instructions. We filter to the 90th-percentile prompt length, retaining 5,099 rows
+with $\leq 1040$ tokens.
+
+
+
+\subsection{GRPO Training Objective}
+
+GRPO~\cite{shao2024} generates $G$ completions $\{o_i\}_{i=1}^G$ per prompt under the
+current policy $\pi_\theta$, then estimates advantages group-internally:
+
+\[
+\hat{A}_i = \frac{R_i - \bar{R}}{\sigma_R + \epsilon}, \quad \bar{R} = \frac{1}{G}\sum_{j=1}^G R_j, \quad \sigma_R = \sqrt{\frac{1}{G}\sum_{j=1}^G (R_j - \bar{R})^2}
+\]
+
+The policy is updated via a clipped surrogate with KL regularization:
+
+\[
+\mathcal{L}_{\mathrm{GRPO}}(\theta) = -\frac{1}{G}\sum_{i=1}^G \Bigl[ \min\!\bigl(\rho_i \hat{A}_i,\; \mathrm{clip}(\rho_i, 1-\varepsilon, 1+\varepsilon)\hat{A}_i\bigr) - \beta\, \mathrm{KL}(\pi_\theta \| \pi_{\mathrm{ref}}) \Bigr]
+\]
+
+where $\rho_i = \pi_\theta(o_i \mid q) / \pi_{\theta_{\mathrm{old}}}(o_i \mid q)$ is
+the importance ratio, $\varepsilon = 0.2$, and $\beta$ is the KL penalty coefficient.
+
+Unlike PPO, GRPO does not require a separate value network; the group mean serves as the
+baseline. This makes it well-suited to small-batch fine-tuning where a value head would
+be expensive relative to the policy update.
+
+The group mean replaces the value network critic, which is critical here: our reward
+functions invoke a full Python environment simulation per completion. A PPO critic would
+need to approximate this simulation-coupled reward --- a separate high-variance
+regression problem on top of the already-expensive policy update.
+
+\subsection{Implementation Details}
+
+\textbf{Model:} Qwen3-8B (BF16), loaded via Unsloth for 4-bit quantized gradient
+checkpointing. LoRA adapters ($r = 32$, $\alpha = 64$) are applied to all projection
+layers, adapting 1.05\% of total parameters (349 MB adapter vs. 16 GB base).
+
+\textbf{Training:} TRL 0.24.0 GRPOTrainer with vLLM 0.6.3 for completion generation.
+$G = 4$ completions per prompt, \texttt{per\_device\_train\_batch\_size = 1}
+(CPU-bound reward functions constrain batch size more than VRAM). Effective batch = 4
+with 4 gradient accumulation steps. Learning rate $5 \times 10^{-6}$, cosine schedule,
+300 steps.
+
+\textbf{Hardware:} A100-SXM4-80GB (2039 GB/s bandwidth). VRAM usage 72,041 MiB of
+81,920 MiB (88\%). Step time: 8.35 s/it. Wall-clock training: \textbf{41--44 minutes}.
+
+\textbf{A100 SM 8.0 workaround:} Setting \texttt{compilation\_config=0} in
+FastLanguageModel disables the piecewise graph-split CUDA compilation that causes a
+segfault on SM 8.0 (A100/A10) under vLLM's \texttt{torch.compile} path. Basic CUDA
+graphs remain enabled.
+
+\textbf{Thinking suppression during training:} Qwen3-8B produces \texttt{<think>}
+reasoning blocks at inference by default. With \texttt{max\_completion\_length = 512},
+these blocks were truncated before the \texttt{</think>} token, producing broken XML
+and preventing the action tag from ever being generated. We suppressed thinking during
+training by omitting the \texttt{/no\_think} directive from prompts and expanding
+\texttt{max\_completion\_length} to permit full think-plus-action sequences. At
+inference, full reasoning is re-enabled (\texttt{enable\_thinking=True},
+\texttt{max\_new\_tokens=4096}).
+
+\textbf{Why batch size = 1.} The reward functions are pure Python --- each call to
+\texttt{reward\_env} instantiates a \texttt{DistributedInfraEnvironment}, replays the
+agent action, and reads the resulting simulation state. At $G = 4$ completions per
+prompt this runs sequentially on CPU. Increasing to batch=4, gen=8 (32
+completions/step) multiplied CPU stall 8$\times$ and increased step time from 8.35 s
+to 126 s --- a 15$\times$ slowdown with no GPU utilization gain. The GPU is idle during
+reward computation. This is the dominant bottleneck in our setup and likely in any
+LLM-GRPO experiment with simulation-coupled rewards.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig6_training_convergence.png}
+  \caption{%
+    Training convergence dashboard across Run 6 (300 steps). \textbf{Top row:}
+    mean reward per step and clipped surrogate ratio (stable $< 0.05$ throughout).
+    \textbf{Middle:} \texttt{frac\_reward\_zero\_std} (zero after step 5, confirming
+    no advantage collapse). \textbf{Bottom:} KL divergence from reference policy
+    and step time (8.35 s/step; the CPU-bound reward plateau is visible between
+    generation bursts). Key checkpoints annotated: step 5 (+5.75), step 20 (+3.43),
+    step 127 (+4.83), step 300 (+2.34).
+  }
+  \label{fig:training-convergence}
+\end{figure}
+
+\section{Negative Results and Ablations}
+
+We ran six training configurations before convergence. The failure modes below are
+ordered by how subtle they are; each is diagnosable from standard TRL metrics.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{clp{4cm}p{4.5cm}l}
+\toprule
+\textbf{Run} & \textbf{Configuration} & \textbf{Failure mode} & \textbf{Diagnostic signal} & \textbf{Step time} \\
+\midrule
+1 & A100-40GB, vLLM default & \texttt{compilation\_config} not set $\to$ segfault on SM 8.0 & Process crash at vLLM init & --- \\
+2 & A100-80GB, batch=4, gen=8 & CPU-bound reward; 32 completions $\times$ 3 s = 96 s stall & \texttt{train\_samples\_per\_second = 0.06}; GPU util $\approx$ 0\% & 126 s/step \\
+3 & batch=1, gen=4, \texttt{max\_comp=256} & \texttt{<think>} block truncated; action tag never generated & \texttt{frac\_reward\_zero\_std = 1.0} from step 1; \texttt{train\_loss} $\approx$ 0 & 20 s/step \\
+4* & batch=1, gen=4, \texttt{max\_comp=512}, \texttt{/no\_think} & Oracle priority inversion (Rule 7 before Rule 2) & Low \texttt{reward\_triage} mean; model throttles in DB-failure states & 8.35 s/step \\
+5 & Run 4 + \texttt{reward\_env} $\times 2$ & Doubled env range $\to [-10,+10]$; 10:1 ratio silences guidance & \texttt{frac\_reward\_zero\_std = 1.0} at step 119; KL spike & 8.5 s/step \\
+\textbf{6*} & Run 4 + oracle fix & --- & Stable \texttt{clipped\_ratio < 0.05} & \textbf{8.4 s/step} \\
+\bottomrule
+\end{tabular}
+\caption{All training runs. *Completed. Run 4 score: 0.4206; Run 6 score: 0.4649.}
+\end{table}
+
+\textbf{The reward coupling failure (Run 5)} deserves elaboration. A collaborator
+proposed doubling $R_{\mathrm{env}}$ to give the physics-based signal more weight. With
+$R_{\mathrm{env}} \in [-10, +10]$ and $R_{\mathrm{tri}} \leq +1$, the environment
+signal dominated at a 10:1 ratio. In early \texttt{traffic\_spike} episodes, DB CPU
+crossed 0.80 on step 1--2, setting $R_{\mathrm{env}} \approx -8$ to $-10$. With the
+triage signal insufficient to distinguish better from worse actions at that scale, all
+completions in a group converged to the same reward ---
+\texttt{frac\_reward\_zero\_std = 1.0} reappeared. This failure mode is not obvious:
+the reward function was technically bounded, and the individual component ranges were
+reasonable in isolation. The pathology emerged from their \textit{ratio} at the
+operating point of the environment. We reverted to $1\times$ weight.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig8_failure_modes.png}
+  \caption{%
+    \textbf{Left:} \texttt{frac\_reward\_zero\_std} across training runs.
+    Runs 3 and 5 hit 1.0 from step 1 (zero-variance collapse); Run 6 stays at 0
+    throughout. \textbf{Right:} Total reward distributions for Runs 3, 5, and 6 at
+    step 50. Run 5's doubled $R_{\mathrm{env}}$ collapses the group variance; Run 6's
+    balanced weights preserve a meaningful gradient signal.
+  }
+  \label{fig:failure-modes}
+\end{figure}
+
+\section{Experiments and Results}
+
+\subsection{Evaluation Protocol}
+
+All evaluations use the same \texttt{inference.py} script under identical conditions:
+local direct environment access (no HTTP overhead), \texttt{enable\_thinking=True},
+\texttt{max\_new\_tokens=4096}. Zero-shot baseline uses the unmodified
+\texttt{Qwen/Qwen3-8B} checkpoint. Fine-tuned evaluation uses \texttt{merged\_16bit}
+(LoRA merged into base weights, BF16). Every task except
+\texttt{memory\_leak\_slow\_burn} received a reward of $-1000$ at every step under the
+original rubric, making zero-shot evaluation uninformative under the old reward; all
+results use the fixed rubric.
+
+\subsection{Ablations}
+
+We trained four runs to isolate the contributions of each fix:
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lll}
+\toprule
+\textbf{Run} & \textbf{Change vs.\ previous} & \textbf{Score} \\
+\midrule
+Zero-shot & --- & 0.3946 \\
+Run 4 & Fixed rubric + \texttt{/no\_think} in training + \texttt{max\_comp=512} & 0.4206 \\
+Run 5 (killed) & \texttt{reward\_env *= 2} (collaborator's branch) & --- \\
+\textbf{Run 6} & Run 4 + oracle Rule 2 before Rule 7 & \textbf{0.4649} \\
+\bottomrule
+\end{tabular}
+\caption{Ablation runs with scores on the 14-task benchmark.}
+\end{table}
+
+Run 5 doubled the environment reward weight to $[-10, +10]$. With the triage signal
+capped at $+1.0$, this produced a $10:1$ environment-to-triage ratio. When
+\texttt{reward\_env} was consistently $-8$ to $-10$ (DB failures early in
+traffic-spike episodes), \texttt{frac\_reward\_zero\_std} hit 1.0 by step 119 and the
+KL term spiked. We killed this run and reverted to the $1\times$ weight.
+
+\subsection{Per-Task Results}
+
+\begin{table}[h]
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Task} & \textbf{Zero-shot} & \textbf{Run 6} & $\boldsymbol{\Delta}$ \\
+\midrule
+\texttt{traffic\_spike} & 0.0242 & 0.0262 & +0.0020 \\
+\texttt{node\_failure} & 0.2200 & 0.2300 & +0.0100 \\
+\texttt{cascading\_failure} & 0.3300 & 0.3200 & $-$0.0100 \\
+\texttt{flash\_crowd} & 0.0100 & 0.0100 & +0.0000 \\
+\texttt{level\_5\_alibaba\_trace} & 0.4146 & 0.5336 & \textbf{+0.1190} \\
+\texttt{thundering\_herd} & 0.3931 & 0.4409 & +0.0478 \\
+\texttt{zombie\_node} & 0.4580 & 0.4902 & +0.0322 \\
+\texttt{memory\_leak\_slow\_burn} & 0.9900 & 0.9900 & +0.0000 \\
+\texttt{split\_brain\_io\_bottleneck} & 0.4286 & 0.5312 & \textbf{+0.1026} \\
+\texttt{black\_swan\_az\_failure} & 0.4379 & 0.4175 & $-$0.0204 \\
+\texttt{retry\_storm} & 0.3767 & 0.5868 & \textbf{+0.2101} \\
+\texttt{hot\_shard\_skew} & 0.4353 & 0.4845 & +0.0492 \\
+\texttt{connection\_pool\_deadlock} & 0.6301 & 0.9762 & \textbf{+0.3461} \\
+\texttt{autoscaler\_flapping\_trap} & 0.3762 & 0.4712 & +0.0950 \\
+\midrule
+\textbf{Average} & \textbf{0.3946} & \textbf{0.4649} & \textbf{+0.0703} \\
+\bottomrule
+\end{tabular}
+\caption{Per-task benchmark scores for zero-shot Qwen3-8B vs.\ fine-tuned Run 6.}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{fig7_benchmark_bars.png}
+  \caption{%
+    Per-task benchmark comparison. Bars show mean episode reward ($\tau_T$) for
+    zero-shot Qwen3-8B (gray) and fine-tuned Run 6 (green), sorted by improvement
+    $\Delta$ descending. \texttt{node\_failure} gains $+0.700$; DB-recovery tasks
+    (\texttt{cascading\_db\_failure}, \texttt{connection\_pool\_deadlock}) show the
+    largest absolute lifts. Tasks in \textcolor{red}{red} regressed slightly; this
+    is attributed to zero-shot over-throttling that happened to match environment
+    reward by chance.
+  }
+  \label{fig:benchmark-bars}
+\end{figure}
+
+\subsection{Qualitative Behavior}
+
+The fine-tuned model shows two consistent behavioural changes relative to zero-shot.
+First, it reliably opens its reasoning trace by checking \texttt{failed\_nodes[0]}
+before any other field, directly encoding the DB-is-SPOF priority. Zero-shot Qwen3-8B
+also attempted \texttt{kubectl delete pod node-0} in database-failure states (13 times
+across 197 baseline steps), indicating the base model had this knowledge --- fine-tuning
+made it \textit{consistent}. Second, when the triage tree prescribes \texttt{throttle},
+the fine-tuned model quotes the specific rate parameter (0.3 for black swan, 0.4 for
+retry storm, 0.7 for DB-CPU protection) while the zero-shot model defaulted uniformly
+to 0.3.
+
+\section{Discussion}
+
+\subsection{Why \texttt{traffic\_spike} and \texttt{node\_failure} Barely Improved}
+
+The tasks \texttt{traffic\_spike} (baseline 0.0242, fine-tuned 0.0262) and
+\texttt{node\_failure} (baseline 0.2200, fine-tuned 0.2300) barely improve. Both
+require multi-step recovery sequences: restart node-0 (2-step boot delay), \textit{then}
+throttle to protect the rebooting node. The GRPO advantage is computed per-step; the
+restart action receives a negative immediate reward because the node is still down for
+the next two steps, even though it is the correct long-horizon choice. This credit
+assignment problem is well-known in the RL literature but is especially acute here
+because the environment's causal delay (boot time) falls within the same episode.
+
+A natural extension is multi-step rollout GRPO or REINFORCE with a shaped shaping
+function that credits the restart action for the subsequent recovery. We leave this to
+future work.
+
+\subsection{Reward Coupling}
+
+We found that reward component weights require care. Doubling $R_{\mathrm{env}}$ (Run 5)
+created a $10:1$ signal-to-guidance ratio that silenced $R_{\mathrm{tri}}$ and allowed
+the environment signal to dominate before the model had learned reliable triage
+priorities. The $1\times$ weighting gives $R_{\mathrm{env}} \in [-5, +5]$ and
+$R_{\mathrm{tri}} \in [-0.5, +1]$ --- a roughly $5:1$ ratio that worked empirically. A
+principled approach (e.g., reward normalization per component) remains an open question.
+
+\subsection{Stochastic Environment Variance}
+
+Because DIME's request simulator has stochastic components, per-task scores vary across
+runs even with a fixed model. In two additional partial runs after the main benchmark,
+\texttt{traffic\_spike} scored 0.3987 (vs.\ 0.0262 in the canonical run) and
+\texttt{node\_failure} opened at 0.9900 before declining to 0.9200 at step 3. This
+variance is comparable to the improvement margins for several tasks and warrants careful
+treatment in future evaluations (e.g., averaging over $\geq 5$ seeds).
+
+We report single-run results here due to time constraints but note this as an important caveat.
+
+\section{Conclusion}
+
+We introduced DIME, fine-tuned Qwen3-8B via GRPO to act as an autonomous SRE agent,
+and achieved a +17.8 pp improvement over the zero-shot baseline in 44 minutes of
+training. More than the final numbers, we believe the documented failure modes are the
+primary contribution: the reward cliff that made policy gradient impossible, the
+thinking-token truncation that silently zeroed gradients, the oracle priority inversion
+that trained plausible-but-wrong behavior, and the reward coupling failure that
+recreated zero-variance advantages from a bounded signal. Each failure was diagnosed
+from standard TRL metrics with no additional tooling, suggesting that
+$\texttt{frac\_reward\_zero\_std}$, $\texttt{clipped\_ratio}$, and
+$\texttt{reward\_triage/mean}$ should be first-class monitoring targets in any
+LLM-GRPO experiment.
+
+The fine-tuned checkpoint is publicly available at
+\texttt{Naseer-010/Qwen3-8B-Finetuned-DIME} on the Hugging Face Hub.
+
+\begin{thebibliography}{99}
+
+\bibitem{shao2024}
+Shao, Z., Wang, P., Zhu, Q., Xu, R., Song, J., Bi, X., Zhang, H., Zhang, M., Li,
+Y.~K., Wu, Y., \& Guo, D. (2024). DeepSeekMath: Pushing the limits of mathematical
+reasoning in open language models. \textit{arXiv:2402.03300}.
+
+\bibitem{schulman2017}
+Schulman, J., Wolski, F., Dhariwal, P., Radford, A., \& Klimov, O. (2017). Proximal
+policy optimization algorithms. \textit{arXiv:1707.06347}.
+
+\bibitem{hu2022}
+Hu, E.~J., Shen, Y., Wallis, P., Allen-Zhu, Z., Li, Y., Wang, S., Wang, L., \& Chen,
+W. (2022). LoRA: Low-rank adaptation of large language models.
+\textit{ICLR 2022. arXiv:2106.09685}.
+
+\bibitem{qwen2025}
+Qwen Team. (2025). Qwen3 technical report. \textit{arXiv:2505.09388}.
+
+\bibitem{yao2023}
+Yao, S., Zhao, J., Yu, D., Du, N., Shafran, I., Narasimhan, K., \& Cao, Y. (2023).
+ReAct: Synergizing reasoning and acting in language models.
+\textit{ICLR 2023. arXiv:2210.03629}.
+
+\bibitem{zhou2023}
+Zhou, S., Xu, F.~F., Zhu, H., Zhou, X., Lo, R., Sridhar, A., Cheng, X., Ou, T.,
+Bisk, Y., Fried, D., Alon, U., \& Neubig, G. (2023). WebArena: A realistic web
+environment for building autonomous agents. \textit{arXiv:2307.13854}.
+
+\bibitem{jimenez2024}
+Jimenez, C.~E., Yang, J., Wettig, A., Yao, S., Pei, K., Press, O., \& Narasimhan, K.
+(2024). SWE-bench: Can language models resolve real-world GitHub issues?
+\textit{ICLR 2024. arXiv:2310.06770}.
+
+\bibitem{shridhar2021}
+Shridhar, M., Yuan, X., C\^{o}t\'{e}, M.-A., Bisk, Y., Trischler, A., \& Hausknecht,
+M. (2021). ALFWorld: Aligning text and embodied environments for interactive learning.
+\textit{ICLR 2021. arXiv:2010.03768}.
+
+\bibitem{wang2024}
+Wang, Z., Liu, Z., Zhang, Y., Zhong, A., Wang, J., Yin, F., Fan, L., Wu, L., \& Wen,
+Q. (2024). RCAgent: Cloud root cause analysis by autonomous agents with tool-augmented
+large language models. \textit{CIKM 2024. arXiv:2310.16340}.
+
+\bibitem{chen2025}
+Chen, Y., Shetty, M., Somashekar, G., Ma, M., Simmhan, Y., Mace, J., Bansal, C.,
+Wang, R., \& Rajmohan, S. (2025). AIOpsLab: A holistic framework to evaluate AI agents
+for enabling autonomous clouds. \textit{MLSys 2025. arXiv:2501.06706}.
+
+\bibitem{ardebili2025}
+Seyedkazemi Ardebili, M., \& Bartolini, A. (2025). KubeIntellect: A modular
+LLM-orchestrated agent framework for end-to-end Kubernetes management.
+\textit{arXiv:2509.02449}.
+
+\bibitem{zou2025}
+Zou, Y., Qi, N., Deng, Y., Xue, Z., Gong, M., \& Zhang, W. (2025). Autonomous
+resource management in microservice systems via reinforcement learning.
+\textit{arXiv:2507.12879}.
+
+\bibitem{vonwerra2020}
+von Werra, L., Belkada, Y., Tunstall, L., Beeching, E., Thrush, T., Lambert, N.,
+Huang, S., Rasul, K., \& Gallouédec, Q. (2020). TRL: Transformer reinforcement
+learning. \textit{https://github.com/huggingface/trl}.
+
+\end{thebibliography}
+
+\end{document}
