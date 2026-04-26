@@ -88,16 +88,14 @@ print(
 # ---------------------------------------------------------------------------
 
 MODEL_NAME = "unsloth/Qwen3-8B"
-MAX_SEQ_LENGTH = 2048
+MAX_SEQ_LENGTH = 3072  # 1040 prompt + 1024 thinking + 1008 buffer
 LORA_RANK = 32
 OUTPUT_DIR = "checkpoints/qwen3_grpo_unsloth"
 
 DATASET_EPISODES = 500  # env rollouts to build the training dataset
 MAX_STEPS = 300  # GRPOTrainer update steps
 NUM_GENERATIONS = 4  # G — completions per prompt; reward_env is CPU-bound, keep small
-MAX_COMPLETION_LENGTH = (
-    512  # Qwen3 no-think response is ~60 tokens; 512 is a safe ceiling
-)
+MAX_COMPLETION_LENGTH = 1024  # thinking (~400 tok) + response (~80 tok) = ~480; 1024 is safe ceiling
 SAVE_STEPS = 100
 
 ALL_TASKS = [
@@ -319,7 +317,6 @@ def collect_dataset(n_episodes: int, tasks: List[str]) -> Dataset:
                         {
                             "role": "user",
                             "content": (
-                                "/no_think\n"  # suppress Qwen3 <think> block — response is ~60 tokens, not ~600
                                 f"Current system state:\n{json.dumps(d)}\n"
                                 "Respond with the required XML and JSON format."
                             ),
@@ -486,10 +483,7 @@ def reward_env(
         action efficiency, temporal friction
       - Bounded to [-5.0, +5.0] — no -1000 cliff, gradients always flow
 
-    Output is scaled by 2× so the environment physics dominates over the
-    oracle (reward_triage) in the total reward signal.
-
-    Range: [−10.0, +10.0]  (2× the raw [-5, +5])
+    Range: [−5.0, +5.0]
     """
     scores = []
     for i, comp in enumerate(completions):
@@ -497,7 +491,7 @@ def reward_env(
             obs_data = json.loads(obs_json[i]) if obs_json else {}
             task_name = task[i] if task else "traffic_spike"
         except (TypeError, IndexError, json.JSONDecodeError):
-            scores.append(-10.0)
+            scores.append(-5.0)
             continue
 
         env = DistributedInfraEnvironment()
@@ -519,17 +513,16 @@ def reward_env(
             pass
 
         if _RUBRICS_BOUNDED:
-            # Main branch: 2× scaled to dominate over oracle reward
-            scores.append(2.0 * _calculate_step_reward(env.sim))
+            scores.append(_calculate_step_reward(env.sim))
         else:
-            # Nithish branch fallback: simple 3-component formula [-5.0, +1.0]
+            # Nithish branch fallback: simple 3-component formula [-2.5, +0.5]
             sim = env.sim
             nodes = sim.nodes
             alive = sum(1 for n in nodes if not n.is_failed)
             r_up = 0.5 * (alive / max(len(nodes), 1))
             r_lat = -0.5 * min((max(0.0, sim.latency_ms - 50.0) / 100.0) ** 2, 1.0)
             r_db = -2.0 if (nodes and nodes[0].is_failed) else 0.0
-            scores.append(2.0 * (r_up + r_lat + r_db))
+            scores.append(r_up + r_lat + r_db)
 
     return scores
 
