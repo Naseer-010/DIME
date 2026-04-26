@@ -23,17 +23,16 @@ export function TextGenerateEffect({
   useEffect(() => {
     const media = window.matchMedia("(prefers-reduced-motion: reduce)");
     const sync = () => setReduceMotion(media.matches);
-    sync();
+    const timer = window.setTimeout(sync, 0);
     media.addEventListener("change", sync);
-    return () => media.removeEventListener("change", sync);
+    return () => {
+      window.clearTimeout(timer);
+      media.removeEventListener("change", sync);
+    };
   }, []);
 
   useEffect(() => {
-    if (!tokens.length) return;
-    if (reduceMotion) {
-      setVisibleCount(tokens.length);
-      return;
-    }
+    if (!tokens.length || reduceMotion) return;
 
     const perWordDelay = Math.max(35, Math.floor(duration / tokens.length));
     const timer = window.setInterval(() => {
@@ -49,10 +48,12 @@ export function TextGenerateEffect({
     return () => window.clearInterval(timer);
   }, [tokens, duration, reduceMotion]);
 
+  const renderedCount = reduceMotion ? tokens.length : visibleCount;
+
   return (
     <p className={cn("flex flex-wrap text-zinc-100", className)}>
       {tokens.map((word, index) => {
-        const visible = index < visibleCount;
+        const visible = index < renderedCount;
         return (
           <span
             key={`${word}-${index}`}
