@@ -67,6 +67,7 @@ BENCHMARK = "distributed_infra_env"
 _tokenizer = None
 _model = None
 _client = None
+_direct_env = None
 
 SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
@@ -89,33 +90,37 @@ Available commands:
 CRITICAL INCIDENT TRIAGE TREE (Follow strictly in order):
 1. OOM IMMINENT (Memory Leak): IF ANY 'mem_utilizations' > 0.92:
    IMMEDIATELY output: kubectl delete pod node-5 (or whichever node is leaking. Scaling does NOT fix memory leaks!)
-   
-2. SPLIT-BRAIN (Disk I/O Bottleneck): IF node_0 'io_wait' > 0.80:
+
+2. DB RECOVERY: IF node-0 is in 'failed_nodes':
+   Output: kubectl delete pod node-0
+   (The DB is a SPOF. If it's dead, ALL other actions are futile until it restarts.)
+
+3. SPLIT-BRAIN (Disk I/O Bottleneck): IF node_0 'io_wait' > 0.80:
    Output: kubectl throttle ingress --rate=0.5 (Do NOT scale up; more workers will lock the DB disk further).
 
-3. HOT SHARD (Load Balancer Skew): IF one worker's CPU > 0.90 but the cluster average is low:
+4. HOT SHARD (Load Balancer Skew): IF one worker's CPU > 0.90 but the cluster average is low:
    Output: kubectl exec -it istio-proxy -- traffic shift --from=<high_cpu_node> --to=<low_cpu_node>
 
-4. RETRY STORM / THUNDERING HERD: IF 'p99_latency' > 100.0 AND traffic is spiking:
+5. RETRY STORM / THUNDERING HERD: IF 'p99_latency' > 100.0 AND traffic is spiking:
    Output: kubectl throttle ingress --rate=0.4 (Break the exponential retry loop).
 
-5. CONNECTION DEADLOCK (Zombie Node): IF a worker's CPU is incredibly low (< 0.10) BUT 'p99_latency' is huge:
+6. CONNECTION DEADLOCK (Zombie Node): IF a worker's CPU is incredibly low (< 0.10) BUT 'p99_latency' is huge:
    Output: kubectl exec -it istio-proxy -- traffic shift --from=<zombie_node> --to=<healthy_node>
 
-6. BLACK SWAN (Multi-Node Death): IF multiple nodes are in 'failed_nodes':
+7. BLACK SWAN (Multi-Node Death): IF multiple nodes are in 'failed_nodes' (but DB is alive):
    Output: kubectl throttle ingress --rate=0.3 (Shed load to protect survivors while you recover).
 
-7. DATABASE SURVIVAL: IF node-0 (DB) cpu_load > 0.80:
+8. DATABASE SURVIVAL: IF node-0 (DB) cpu_load > 0.80:
    Output: kubectl throttle ingress --rate=0.7
 
-8. SAFE SCALING: IF avg worker CPU > 0.75 AND 'error_budget' > 20:
+9. SAFE SCALING: IF avg worker CPU > 0.75 AND 'error_budget' > 20:
    Output: kubectl scale deployment frontend --replicas=10
 
-9. HEALTHY / FLAPPING TRAP: If metrics are stable or oscillating slightly:
+10. HEALTHY / FLAPPING TRAP: If metrics are stable or oscillating slightly:
    Output: no_op
 
 Respond using the following STRICT format. You must include the XML reasoning tags:
-<reasoning>Diagnose the telemetry. Identify which of the 9 Triage rules applies.</reasoning>
+<reasoning>Diagnose the telemetry. Identify which of the 10 Triage rules applies.</reasoning>
 <action>
 {"command": "your_kubectl_command_or_no_op_here"}
 </action>"""
@@ -641,6 +646,81 @@ def env_step(env_url: str, action: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Direct (in-process) environment access — used when --mode local so the HTTP
+# server does not need to be running separately.
+# ---------------------------------------------------------------------------
+def _get_direct_env():
+    global _direct_env
+    if _direct_env is None:
+        from server.environment import DistributedInfraEnvironment
+
+        _direct_env = DistributedInfraEnvironment()
+    return _direct_env
+
+
+def _infraobs_to_dict(obs) -> dict:
+    keys = [
+        "cpu_loads",
+        "mem_utilizations",
+        "queue_lengths",
+        "failed_nodes",
+        "latency_ms",
+        "request_rate",
+        "io_wait",
+        "p99_latency",
+        "error_budget",
+        "step",
+        "task_hint",
+        "action_errors",
+        "cloud_budget",
+        "task_score",
+        "done",
+        "reward",
+        "uptime_pct",
+    ]
+    return {k: getattr(obs, k) for k in keys if hasattr(obs, k)}
+
+
+def env_reset_direct(task_id: str) -> dict:
+    return _infraobs_to_dict(_get_direct_env().reset(task=task_id))
+
+
+def env_step_direct(action_dict: dict) -> dict:
+    from server.models import InfraAction
+
+    env = _get_direct_env()
+    raw_cmd = action_dict.get("raw_command")
+    if raw_cmd and raw_cmd != "no_op":
+        action = InfraAction(action_type="no_op", raw_command=raw_cmd)
+    else:
+        act_type = action_dict.get("action_type", "no_op")
+        kwargs: dict = {"action_type": act_type}
+        if (
+            act_type in ("restart_node", "query_logs")
+            and action_dict.get("target") is not None
+        ):
+            kwargs["target"] = int(action_dict["target"])
+        elif act_type == "reroute_traffic":
+            kwargs["from_node"] = int(action_dict.get("from_node", 0))
+            kwargs["to_node"] = int(action_dict.get("to_node", 0))
+        elif act_type == "throttle" and action_dict.get("rate") is not None:
+            kwargs["rate"] = float(action_dict["rate"])
+        try:
+            action = InfraAction(**kwargs)
+        except Exception:
+            action = InfraAction(action_type="no_op")
+    obs = env.step(action)
+    obs_dict = _infraobs_to_dict(obs)
+    return {
+        "data": {
+            "observation": obs_dict,
+            "reward": getattr(obs, "reward", 0.0),
+            "done": getattr(obs, "done", False),
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
 # Task Runner
 # ---------------------------------------------------------------------------
 def run_task(
@@ -654,13 +734,14 @@ def run_task(
     csv_path: Path,
     structured_logger: StructuredLogger,
     max_episode_steps: int = 100,
+    use_direct: bool = False,
 ) -> dict:
     log_start(task=task_id, env=BENCHMARK, model=model_name, mode=mode)
     episode_path = structured_logger.start_episode(task_id)
     print(f"[INFO] Structured log: {episode_path}", flush=True)
 
     try:
-        obs = env_reset(env_url, task_id)
+        obs = env_reset_direct(task_id) if use_direct else env_reset(env_url, task_id)
     except Exception as e:
         print(
             f"[FATAL ERROR] Failed to connect to environment server for task '{task_id}': {e}",
@@ -711,7 +792,11 @@ def run_task(
         done = False
 
         try:
-            result = env_step(env_url, backend_action)
+            result = (
+                env_step_direct(backend_action)
+                if use_direct
+                else env_step(env_url, backend_action)
+            )
             data_block = result.get("data", result)
 
             if "observation" in data_block and isinstance(
@@ -870,6 +955,7 @@ def main():
         print(f"  STRUCTURED LOGS: {log_dir}")
         print("==================================================")
 
+        use_direct = mode == "local"
         for task_id in tasks:
             stats = run_task(
                 task_id,
@@ -881,6 +967,7 @@ def main():
                 csv_path=csv_file,
                 structured_logger=structured_logger,
                 max_episode_steps=max_steps,
+                use_direct=use_direct,
             )
             all_task_stats.append(stats)
 

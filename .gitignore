@@ -18,3 +18,10 @@ distributed_infra_env/
 pre_validate.sh
 test_venv/
 venv/
+
+# Model checkpoints and training artifacts (large binaries — distribute via tar)
+checkpoints/
+grpo_trainer_lora_model/
+unsloth_compiled_cache/
+*.tar
+*.tar.gz
