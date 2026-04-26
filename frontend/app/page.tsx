@@ -1,11 +1,12 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { FlipWords } from "@/components/ui/FlipWords";
 import { FloatingDock } from "@/components/ui/FloatingDock";
 import { FocusCards } from "@/components/ui/FocusCards";
 import { TextGenerateEffect } from "@/components/ui/TextGenerateEffect";
 import { ClusterSimulation } from "@/components/simulation/ClusterSimulation";
+import { useSimulationSocket } from "@/lib/useSimulationSocket";
 import type { DockItem, FocusCard } from "@/components/ui/types";
 
 type TelemetrySnapshot = {
@@ -234,9 +235,8 @@ function RevealSection({
     <section
       id={id}
       ref={ref}
-      className={`scroll-mt-28 transition-all duration-700 motion-reduce:transform-none motion-reduce:opacity-100 ${
-        visible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
-      } ${className ?? ""}`}
+      className={`scroll-mt-28 transition-all duration-700 motion-reduce:transform-none motion-reduce:opacity-100 ${visible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+        } ${className ?? ""}`}
     >
       {children}
     </section>
@@ -346,45 +346,61 @@ function parseTelemetry(payload: unknown): TelemetrySnapshot | null {
   };
 }
 
-export default function Home() {
-  const [telemetry, setTelemetry] = useState<TelemetrySnapshot | null>(null);
-  const [telemetryError, setTelemetryError] = useState<string | null>(null);
-  const [showScrollCue, setShowScrollCue] = useState(true);
+function useAnimatedFallback(): TelemetrySnapshot {
+  const [snapshot, setSnapshot] = useState<TelemetrySnapshot>({
+    step: 0,
+    cpuLoads: [0.3, 0.25, 0.4, 0.35, 0.28, 0.32, 0.38, 0.22],
+    queueLengths: [4, 6, 3, 8, 5, 7, 2, 4],
+    latencyMs: 32.5,
+    failedNodes: [],
+    requestRate: 142,
+  });
 
   useEffect(() => {
-    let mounted = true;
-
-    const loadTelemetry = async () => {
-      try {
-        const response = await fetch("/api/telemetry", { cache: "no-store" });
-        if (!response.ok) {
-          throw new Error(`telemetry request failed (${response.status})`);
-        }
-
-        const payload: unknown = await response.json();
-        const parsed = parseTelemetry(payload);
-
-        if (!parsed) {
-          throw new Error("telemetry payload did not match expected schema");
-        }
-
-        if (!mounted) return;
-        setTelemetry(parsed);
-        setTelemetryError(null);
-      } catch (error) {
-        if (!mounted) return;
-        setTelemetryError(error instanceof Error ? error.message : "unable to fetch telemetry");
-      }
-    };
-
-    loadTelemetry();
-    const timer = window.setInterval(loadTelemetry, 2500);
-
-    return () => {
-      mounted = false;
-      window.clearInterval(timer);
-    };
+    let step = 0;
+    const timer = setInterval(() => {
+      step += 1;
+      const t = step * 0.15;
+      setSnapshot({
+        step,
+        cpuLoads: Array.from({ length: 8 }, (_, i) =>
+          Math.max(0.05, Math.min(0.95, 0.35 + 0.25 * Math.sin(t + i * 0.8) + (Math.random() - 0.5) * 0.08))
+        ),
+        queueLengths: Array.from({ length: 8 }, (_, i) =>
+          Math.max(0, Math.round(12 + 10 * Math.sin(t * 0.7 + i) + Math.random() * 4))
+        ),
+        latencyMs: Math.max(8, 35 + 20 * Math.sin(t * 0.5) + Math.random() * 8),
+        failedNodes: step % 30 > 22 && step % 30 < 28 ? [Math.floor(Math.random() * 7) + 1] : [],
+        requestRate: Math.max(50, 150 + 80 * Math.sin(t * 0.3) + Math.random() * 20),
+      });
+    }, 500);
+    return () => clearInterval(timer);
   }, []);
+
+  return snapshot;
+}
+
+export default function Home() {
+  const { packet, connected } = useSimulationSocket();
+  const animatedFallback = useAnimatedFallback();
+  const [showScrollCue, setShowScrollCue] = useState(true);
+
+  const telemetry: TelemetrySnapshot | null = (() => {
+    if (connected && packet?.observation) {
+      const obs = packet.observation;
+      return {
+        step: obs.step ?? 0,
+        cpuLoads: obs.cpu_loads ?? [],
+        queueLengths: obs.queue_lengths ?? [],
+        latencyMs: obs.latency_ms ?? 0,
+        failedNodes: obs.failed_nodes ?? [],
+        requestRate: obs.request_rate ?? 0,
+      };
+    }
+    return animatedFallback;
+  })();
+
+  const telemetryError: string | null = !connected ? "backend offline — showing animated preview" : null;
 
   useEffect(() => {
     const onScroll = () => {
@@ -635,9 +651,8 @@ export default function Home() {
 
             <div className="mt-4 flex items-center gap-2 font-mono text-xs text-zinc-500">
               <span
-                className={`inline-block h-2 w-2 rounded-full ${
-                  DEPLOYMENT_LIVE ? "animate-pulse bg-emerald-400" : "bg-amber-400"
-                }`}
+                className={`inline-block h-2 w-2 rounded-full ${DEPLOYMENT_LIVE ? "animate-pulse bg-emerald-400" : "bg-amber-400"
+                  }`}
               />
               {DEPLOYMENT_LIVE ? "Simulation Online" : "Coming Soon"}
             </div>
