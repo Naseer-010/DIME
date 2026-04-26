@@ -12,6 +12,7 @@ import os
 from openenv.core.env_server.http_server import create_app
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
 
 from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
