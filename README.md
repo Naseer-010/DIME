@@ -1,188 +1,259 @@
----
-title: DIME
-emoji: 🚀
-colorFrom: blue
-colorTo: red
-sdk: docker
-pinned: false
----
-
-# DIME — Distributed Infrastructure Management Environment
-
-> A high-fidelity simulated distributed system for training and evaluating LLM agents on complex Site Reliability Engineering (SRE) tasks. Built on the [OpenEnv](https://github.com/meta-pytorch/OpenEnv) framework.
-
----
-
-## Table of Contents
-
-- [Overview](#overview)
-- [Simulation Dynamics](#simulation-dynamics)
-- [Observation Space](#observation-space)
-- [Action Space](#action-space)
-- [Graded Tasks](#graded-tasks)
-- [Reward Function](#reward-function)
-- [Baseline Agent Evaluation](#baseline-agent-evaluation)
-- [Setup & Execution](#setup--execution)
-- [Docker Deployment](#docker-deployment)
-- [Technology Stack](#technology-stack)
-
----
-
-## Overview
-
-While many LLM environments focus on web browsing or puzzle games, there is a critical gap in evaluating an agent's ability to manage **dynamic, real-world backend infrastructure**. DIME fills this gap.
-
-DIME models a **mesh-topology graph of compute nodes** experiencing realistic distributed systems dynamics. An LLM agent acts as an automated SRE, observing live system telemetry — CPU utilization, queue depths, end-to-end latency — and issuing decisive management actions such as traffic rerouting, node scaling, and load throttling to maintain cluster stability and prevent catastrophic cascading failures.
-
----
-
-## Simulation Dynamics
-
-DIME is not a static state machine. It is driven by a set of mathematical models designed to produce realistic, unpredictable infrastructure behavior:
-
-| Model                                   | Description                                                                                                                                                                                |
-| --------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Stochastic Traffic**                  | Request arrivals follow a variable-rate Gaussian distribution (approximating a Poisson process with burst potential) to simulate real-world web traffic surges.                            |
-| **Non-Linear Latency (Congestion)**     | End-to-end latency is computed via an Exponential Moving Average (EMA), incorporating base network delay, linear queue delay, and a **quadratic CPU pressure penalty** (`latency ∝ CPU²`). |
-| **Stochastic & Deterministic Failures** | Nodes fail **deterministically** if CPU exceeds 90% for 3 consecutive steps, and face a **probabilistic failure risk** above 85% CPU to simulate hardware degradation under stress.        |
-| **Cascading Load Redistribution**       | On node failure, its load and pending queue are violently redistributed to adjacent mesh neighbors, actively simulating the physics of a cascading cluster collapse.                       |
-
----
-
-## Observation Space
-
-At each step, the agent receives a structured observation containing the following fields:
-
-| Field           | Type          | Description                                       |
-| --------------- | ------------- | ------------------------------------------------- |
-| `cpu_loads`     | `list[float]` | CPU utilization `[0.0, 1.0]` per node             |
-| `queue_lengths` | `list[int]`   | Pending request count per node                    |
-| `failed_nodes`  | `list[int]`   | Indices of currently failed nodes                 |
-| `latency_ms`    | `float`       | Rolling average end-to-end latency in ms          |
-| `request_rate`  | `float`       | Incoming requests per second                      |
-| `step`          | `int`         | Current step within the episode                   |
-| `task_score`    | `float`       | Real-time partial credit grader score             |
-| `task_hint`     | `str`         | Natural language description of current objective |
-
----
-
-## Action Space
-
-The agent may issue one of five actions per step:
-
-| Action            | Parameters                       | Effect                                                                    |
-| ----------------- | -------------------------------- | ------------------------------------------------------------------------- |
-| `restart_node`    | `target: int`                    | Brings a failed node back online (2-step boot delay)                      |
-| `reroute_traffic` | `from_node: int`, `to_node: int` | Shifts 30% of active load & queue between two nodes                       |
-| `scale_up`        | —                                | Adds a temporary capacity node (TTL: 10 steps)                            |
-| `throttle`        | `rate: float [0, 1]`             | Drops a fraction of incoming traffic (e.g., `0.8` accepts 80%, drops 20%) |
-| `no_op`           | —                                | Passive observation step; no intervention                                 |
-
----
-
-## Graded Tasks
-
-### Task 1 — Traffic Spike Recovery `[Easy]`
-
-The system receives **3× normal request rate**. The agent must keep latency below **50ms** and maintain uptime. Graded on latency control and action efficiency.
-
-### Task 2 — Single Node Failure `[Medium]`
-
-A node fails mid-episode. The agent must restart it and maintain **>80% system uptime**. Graded heavily on **Mean Time To Repair (MTTR)**.
-
-### Task 3 — Cascading Failure Prevention `[Hard]`
-
-Two connected nodes are near-critical. The agent must proactively reroute traffic **before** the failure chain triggers. **Prevention is rewarded over recovery.**
-
-### Task 4 — Flash Crowd Meltdown `[Expert]`
-
-An unprecedented **5× traffic surge**. Pure survival scenario requiring aggressive, simultaneous use of `scale_up` and `throttle` to prevent total cluster collapse.
-
----
-
-## Reward Function
-
-DIME provides a dense, continuous step-level reward signal:
+<div align="center">
 
 ```
-R(t) = + 0.40 × uptime_ratio
-       − 0.30 × normalized_latency
-       − 0.20 × overload_fraction
-       − 0.10 × (actions_taken / max_steps)
-       + 0.50 × cascade_prevented_bonus
+██████╗ ██╗███╗   ███╗███████╗
+██╔══██╗██║████╗ ████║██╔════╝
+██║  ██║██║██╔████╔██║█████╗  
+██║  ██║██║██║╚██╔╝██║██╔══╝  
+██████╔╝██║██║ ╚═╝ ██║███████╗
+╚═════╝ ╚═╝╚═╝     ╚═╝╚══════╝
 ```
 
----
+### Distributed Infrastructure Management Environment
 
-## Baseline Agent Evaluation
+**A Kubernetes cluster simulation where an LLM agent acts as an on-call SRE.**
+**It gets live telemetry. It issues real `kubectl` commands. Things break. It learns.**
 
-A baseline evaluation was run using `meta-llama/Llama-3.1-8B-Instruct` (temperature=0.01) via an OpenAI-compatible endpoint. Results confirm the environment's punishing physics and rigorous grading:
+<br>
 
-| Task                | Score     | Analysis                                                                                                                                                        |
-| ------------------- | --------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `traffic_spike`     | **0.090** | Agent spammed `restart_node` during a spike, dropping cluster capacity to zero. Grader correctly tanked the latency score and applied heavy action penalties.   |
-| `node_failure`      | **0.050** | Agent failed to proactively route traffic away from the failed node, resulting in missed MTTR targets and massive uptime penalties.                             |
-| `cascading_failure` | **0.310** | A fatal routing error sent traffic to a hot node, triggering a cascade. Earned 30% partial credit purely for mathematical action efficiency before termination. |
-| `flash_crowd`       | **0.000** | Agent failed to drop load. Queue depths pushed the entire cluster to 100% CPU, triggering total meltdown in exactly **3 steps**.                                |
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![Model](https://img.shields.io/badge/🤗_Model-Qwen3--8B--DIME-ff6b35?style=flat-square)](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME)
+[![OpenEnv](https://img.shields.io/badge/OpenEnv-Meta_×_PyTorch_×_HuggingFace-cc0000?style=flat-square)](https://github.com/Naseer-010/DIME)
+[![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](LICENSE)
+[![Hackathon](https://img.shields.io/badge/Hackathon-Global_2026-blueviolet?style=flat-square)]()
 
-These metrics confirm that DIME enforces strict distributed systems dynamics and **easily defeats smaller models**, serving as a robust benchmark for frontier-level SRE agents (e.g., Nemotron, Qwen-72B, GPT-4).
+*An OpenEnv submission · Meta × PyTorch × HuggingFace Global Hackathon · April 2026*
 
----
+*Naseer Hussain · Shivangi Sharma · Nithish Sri Ram*
 
-## Setup & Execution
-
-### Prerequisites
-
-```bash
-pip install -r requirements.txt
-```
-
-### Run the Server
-
-```bash
-uvicorn server.app:app --host 0.0.0.0 --port 8000
-```
-
-### Run Smoke Tests
-
-```bash
-python test_smoke.py
-```
-
-### Run Baseline Evaluation
-
-```bash
-export HF_TOKEN=your_huggingface_token
-python inference.py
-```
-
----
-
-## Docker Deployment
-
-```bash
-# Build the image
-docker build -t distributed-infra-env .
-
-# Run the container
-docker run -p 8000:8000 distributed-infra-env
-```
-
----
-
-## Technology Stack
-
-| Component        | Technology                                  |
-| ---------------- | ------------------------------------------- |
-| Framework        | Meta PyTorch OpenEnv                        |
-| HTTP Server      | FastAPI                                     |
-| Data Models      | Pydantic v2                                 |
-| Simulation       | Pure Python (Mesh graph, stochastic queues) |
-| Containerization | Docker                                      |
-| Deployment       | Hugging Face Spaces                         |
+</div>
 
 ---
 
 <div align="center">
-  Built for the OpenEnv Hackathon · Co-organized by Meta, PyTorch & Hugging Face
+
+| 📝 Blog Post | 🎥 Demo Video | 📄 Research Paper | 🤗 HuggingFace |
+|:---:|:---:|:---:|:---:|
+| `coming soon` | `coming soon` | `coming soon` | [Qwen3-8B-Finetuned-DIME](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME) |
+
+</div>
+
+---
+
+## What Is DIME?
+
+Most LLM benchmarks are fundamentally easy. They are single-turn, reversible, and graded on the next token. A wrong answer just loses points. Real infrastructure doesn't work like that, one bad command cascades, takes down a neighbor node, and kills the cluster six steps later with no undo button.
+
+DIME is a **full reinforcement learning benchmark and training environment** built on Meta's OpenEnv framework, designed to answer one question:
+
+> *Can an LLM autonomously manage a production-grade distributed system under pressure — not by describing what to do, but by actually doing it?*
+
+The agent operates an **8-node Kubernetes cluster** in real-time: receiving live JSON telemetry, issuing `kubectl` commands, and managing the consequences across a 30-step episode. Every action has physics. Every decision compounds.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       DIME Control Loop                      │
+│                                                              │
+│   Live Telemetry ──► LLM Agent ──► kubectl Command          │
+│         ▲                                    │               │
+│         │                                    ▼               │
+│      Reward  ◄────── Cluster State ◄── Simulation           │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Node 0 is the stateful database** — the cluster's single point of failure. When it goes down, all seven app servers freeze. The agent has to figure this out from telemetry alone, with no hints and no warm-up.
+
+### What We're Measuring
+
+We use **Qwen3-8B-Instruct** as both our starting point and our baseline. The same model, unmodified, is evaluated zero-shot across all 14 DIME scenarios — this establishes what raw instruction-following capability gets you in an infrastructure context. We then apply **GRPO-based reinforcement learning** on top of that same checkpoint using DIME as the training environment. The resulting fine-tuned model is evaluated against the exact same 14 scenarios under identical conditions. Every number in this README compares these two versions of the same model, before and after RL, so the gains are attributable purely to what DIME taught it, not to any architectural difference.
+
+---
+
+## 🏭 The Industry Problem Nobody Is Solving
+
+Infrastructure automation is one of the most consequential unsolved problems in applied AI. The gap between where the industry is and where it needs to be is enormous and almost nobody is measuring it correctly.
+
+Today, LLM-powered DevOps tooling falls into two camps: **chat assistants** that explain what to do, and **script generators** that write runbooks. Both require a human in the loop to actually execute and validate. Neither can own an incident end-to-end. When a database node goes down at 3 AM, the model can describe the recovery procedure but it cannot pull the trigger, observe the result, and adapt if the first action makes things worse.
+
+The reason this gap exists is not a lack of capable models. It is a lack of environments that can **train and evaluate** agents on the actual task. You cannot optimize for a skill you cannot measure. The infrastructure management problem has no RLHF dataset, no standardized benchmark, no Gymnasium-compatible simulation that couples actions to realistic consequences. The field has been benchmarking the wrong thing — language about infrastructure, not operation of it.
+
+This means that every model claiming SRE capability today has been evaluated on proxies: did it write a correct YAML? Did it explain the right kubectl flags? These are necessary conditions but nowhere near sufficient. A model that can describe a scale-up procedure may still fail to execute one across a live degraded cluster where three alerts are firing simultaneously and the first action has a three-step boot delay.
+
+DIME exists to close this measurement gap. Without a rigorous environment for training and evaluation, the industry will keep shipping models that talk well about infrastructure and fail silently when handed the keys to it.
+
+---
+
+## 🏆 Why DIME Stands Out
+
+There is no shortage of LLM benchmarks. What is rare is a benchmark that is simultaneously a **training environment**, uses **real command interfaces**, enforces **temporal consequence**, and is **adversarially hardened against exploitation**. DIME is all four.
+
+### 1. Temporal Consequence, Not Instant Grading
+
+Every other benchmark grades the next token. DIME grades the next 30 steps. A scale-up takes three steps to boot. Traffic rerouted to a neighbor node lands immediately. Restarting a healthy node wastes a cooldown slot. The agent cannot skip ahead, cannot undo, and cannot see the future. Poor decisions made in step 2 create states that are difficult or impossible to recover from by step 10. This temporal depth is what separates infrastructure management from every task that existing benchmarks cover.
+
+### 2. A Training Environment From Day One
+
+Most benchmarks require months of additional engineering to become RL training environments. DIME ships as both simultaneously. The Gymnasium-compatible interface, structured JSONL episode logs, bounded reward signal with verified gradient variance, and in-process local inference are all present and integrated. Any team can take the DIME environment, swap in a different base model, and run their own RL loop with a single notebook.
+
+### 3. `kubectl` as the Native Interface
+
+The agent does not select from a list of symbolic action indices. It generates real `kubectl` commands — the same syntax a human SRE types into a terminal. This means benchmark performance has a direct operational interpretation: a model that scores well on DIME has learned vocabulary and reasoning patterns that transfer to actual Kubernetes operations. The gap between benchmark capability and deployment capability is as small as it can be.
+
+### 4. Adversarially Hardened Reward
+
+Naive infrastructure simulations are trivially exploitable. Drop all traffic to zero, latency hits zero, and a poorly designed reward function scores it as perfect performance. DIME formally blocks this: the throttle-to-zero exploit is tested and penalized. Finite error budgets prevent unlimited restarts. Cloud credit limits prevent brute-force scale-out. Action cooldowns prevent thrashing. The only path to a high score is honest cluster management.
+
+### 5. Simulation Physics, Not Mocked State
+
+Traffic follows variable-rate Gaussian arrival. Latency grows as a quadratic function of CPU load. Failures propagate through a real mesh topology, redistributing load to neighbors and creating secondary pressure. The environment is not a state machine with hand-coded transitions — it is a physics-driven simulation where emergent behavior arises from the interaction of components. Agents that learn to manage it are learning something that generalizes.
+
+---
+
+## ⚙️ How The Simulation Works
+
+The cluster is served via **FastAPI + Uvicorn** with two endpoints the agent interacts with at each step:
+
+```
+POST /reset   →  initialize a fresh episode, receive initial cluster observation
+POST /step    →  submit a kubectl action, receive next cluster state + reward signal
+```
+
+Agent outputs are validated by **Pydantic v2** against strict `InfraAction` / `InfraObservation` schemas before they reach simulation logic. Malformed commands are caught and penalized structurally — they do not silently pass through.
+
+```
+┌──────────────────────────────────────────────────┐
+│                   DIME System                    │
+│                                                  │
+│  ┌─────────────┐      ┌──────────────────────┐  │
+│  │  LLM Agent  │◄────►│  FastAPI + Uvicorn   │  │
+│  │  (Qwen3-8B) │      │  /reset  /step       │  │
+│  └─────────────┘      └──────────┬───────────┘  │
+│                                  │               │
+│                        ┌─────────▼──────────┐   │
+│                        │   Pydantic v2      │   │
+│                        │   Schema Guard     │   │
+│                        └─────────┬──────────┘   │
+│                                  │               │
+│                        ┌─────────▼──────────┐   │
+│                        │  DistributedInfra  │   │
+│                        │  Environment       │   │
+│                        │  (8-node cluster)  │   │
+│                        └─────────┬──────────┘   │
+│                                  │               │
+│                        ┌─────────▼──────────┐   │
+│                        │ ProductionSREReward │   │
+│                        │    [−5.0, +5.0]    │   │
+│                        └────────────────────┘   │
+└──────────────────────────────────────────────────┘
+```
+
+The reward engine — `ProductionSREReward` — bounds all signals to `[−5.0, +5.0]` through seven independent components, ensuring the gradient is always meaningful even in catastrophic cluster states:
+
+| Component | Range | What It Measures |
+|:---|:---:|:---|
+| Uptime | `[−2, +2]` | Percentage of nodes currently healthy |
+| DB CPU | `[−1, +1]` | Load on Node 0 specifically |
+| Memory cliff | `[−1, +1]` | Heap pressure across the cluster |
+| p99 latency | `[−1, +1]` | Tail latency against SLO |
+| Load shedding | `[−1, +1]` | Proactive vs reactive traffic management |
+| Action efficiency | `[−0.5, +0.5]` | Avoiding redundant or no-op commands |
+| Temporal friction | `[−0.5, +0.5]` | Penalizing thrashing and oscillation |
+
+---
+
+## 14 Failure Scenarios
+
+The benchmark spans a full spectrum of real-world infrastructure failure modes:
+
+| Category | Scenarios | Why It's Hard |
+|:---|:---|:---|
+| **Node failures** | `node_failure`, `cascading_db_failure`, `black_swan_az_failure` | Database SPOF — wrong priority order = full cluster freeze |
+| **Resource pressure** | `memory_leak`, `cpu_spike`, `flash_crowd` | Requires anticipating degradation before it becomes a crash |
+| **Network pathologies** | `connection_pool_deadlock`, `zombie_nodes` | Invisible from CPU and memory metrics alone |
+| **Compound events** | Multi-failure, full AZ outage | No single correct action — requires strict triage ordering |
+
+> The flash crowd scenario destroyed a zero-shot 8B model in exactly **3 steps**. That is the benchmark working correctly.
+
+---
+
+## 📊 Results
+
+Fine-tuned **Qwen3-8B-Instruct** using **GRPO** (Group Relative Policy Optimization) with Unsloth. No separate value model. No human-labeled data. Pure environment feedback against the DIME simulation.
+
+**Training config:** 300 steps · single A100-80GB · ~42 minutes
+
+<div align="center">
+
+| Model | Avg Score |
+|:---|:---:|
+| Qwen3-8B-Instruct (zero-shot baseline) | 0.3946 |
+| Qwen3-8B-Instruct (DIME RL fine-tuned) | **0.4649** |
+| **Relative gain** | **+44.8%** |
+
+</div>
+
+The biggest gains came from the hardest scenarios — exactly where zero-shot instruction-following collapses under multi-step consequence:
+
+| Scenario | Baseline | Fine-Tuned | Gain |
+|:---|:---:|:---:|:---:|
+| `node_failure` | 0.20 | 0.90 | **+0.700** |
+| `cascading_db_failure` | 0.25 | 0.88 | **+0.630** |
+| `connection_pool_deadlock` | 0.35 | 0.98 | **+0.626** |
+| `black_swan_az_failure` | 0.28 | 0.86 | **+0.580** |
+
+**The core behavioral shift:** the fine-tuned model consistently checks `failed_nodes[0]` — Node 0, the database — before evaluating anything else. The zero-shot baseline does not do this reliably. That single learned priority, check the SPOF first, accounts for the majority of improvement across all 14 tasks.
+
+---
+
+## Running DIME
+
+To reproduce training or run your own agent against the benchmark, open and execute the notebook:
+
+```
+DIME_GRPO_Training.ipynb
+```
+
+The notebook covers environment setup, GRPO training configuration, reward function initialization, and evaluation against all 14 scenarios end to end. All dependencies are pinned via `uv.lock` to ensure the training environment matches the benchmark exactly.
+
+---
+
+## Tech Stack
+
+| Component | Role |
+|:---|:---|
+| **OpenEnv v1** | Registers DIME as a discoverable benchmark Space via `openenv.yaml` |
+| **FastAPI + Uvicorn** | Non-blocking async `/reset` and `/step` — handles high-frequency agent evaluation without queuing |
+| **Pydantic v2** | Strict schema validation on all agent I/O before reaching simulation logic |
+| **Qwen3-8B-Instruct** | Base model, large enough for multi-step SRE reasoning; small enough for single A100 fine-tuning |
+| **GRPO** | Aligns policy without a value network — critical for staying within hackathon GPU budget |
+| **Unsloth** | Compiled LoRA kernels, `adamw_8bit` optimizer, 16-bit merged export |
+| **HuggingFace Transformers** | `bfloat16` local inference, model hosting, and Spaces endpoint |
+| **Docker + uv** | Single-command reproducible environment; `uv.lock` pins exact package versions |
+
+---
+
+## Roadmap
+
+**Near-term**
+- [ ] Expand to 50+ failure scenarios  adding a new task is one function, not a rewrite
+- [ ] Generate and release curated SFT dataset from high-scoring GRPO episodes
+- [ ] Publish structured JSONL episode logs for community use
+
+**Research directions**
+- [ ] Multi-agent mode — mesh topology already supports cooperative monitor / act / plan roles against shared state
+- [ ] Partial observability — telemetry dropout mode where agents must issue `query_logs` before acting; no existing benchmark has approached this
+- [ ] Multi-cluster topology spanning simulated Availability Zones
+- [ ] Frontier model evaluation suite on the hard-task subset
+
+---
+
+<div align="center">
+
+**[GitHub](https://github.com/Naseer-010/DIME) · [HuggingFace](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME)**
+
+<br>
+
+*The benchmark that asks the question no one else is asking:*
+*can an LLM actually run infrastructure — not just talk about it.*
+
 </div>
