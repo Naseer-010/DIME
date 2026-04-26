@@ -222,12 +222,6 @@ The notebook covers environment setup, GRPO training configuration, reward funct
 
 ---
 
-<div align="center">
-
-**[GitHub](https://github.com/Naseer-010/DIME) · [HuggingFace](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME)**
-
-<br>
-
 *The environment that asks the question no one else is asking:* *can an LLM actually run infrastructure — not just talk about it.*
 
 </div>
