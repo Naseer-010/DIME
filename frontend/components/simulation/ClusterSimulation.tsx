@@ -210,7 +210,7 @@ export function ClusterSimulation() {
         </div>
       </div>
 
-      <div className="h-[30rem] w-full overflow-hidden rounded-xl border border-zinc-800 bg-[radial-gradient(circle_at_30%_20%,rgba(56,189,248,0.08),transparent_35%),radial-gradient(circle_at_80%_80%,rgba(45,212,191,0.08),transparent_35%)]">
+      <div className="h-[clamp(20rem,62vh,30rem)] w-full overflow-hidden rounded-xl border border-zinc-800 bg-[radial-gradient(circle_at_30%_20%,rgba(56,189,248,0.08),transparent_35%),radial-gradient(circle_at_80%_80%,rgba(45,212,191,0.08),transparent_35%)]">
         <ReactFlow
           nodes={nodes}
           edges={edges}

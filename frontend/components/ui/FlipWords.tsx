@@ -15,8 +15,18 @@ export function FlipWords({ words, className, duration = 2500 }: FlipWordsProps)
     [words]
   );
   const [activeIndex, setActiveIndex] = useState(0);
+  const [reduceMotion, setReduceMotion] = useState(false);
 
   useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const sync = () => setReduceMotion(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+
+  useEffect(() => {
+    if (reduceMotion) return;
     if (normalizedWords.length <= 1) return;
 
     const interval = window.setInterval(() => {
@@ -24,20 +34,26 @@ export function FlipWords({ words, className, duration = 2500 }: FlipWordsProps)
     }, Math.max(400, duration));
 
     return () => window.clearInterval(interval);
-  }, [duration, normalizedWords]);
+  }, [duration, normalizedWords, reduceMotion]);
 
   if (!normalizedWords.length) {
     return null;
   }
 
   const visibleIndex = activeIndex % normalizedWords.length;
+  const staticWord = normalizedWords[0];
 
   return (
     <span className={cn("inline-flex items-center", className)}>
       <span aria-live="polite" aria-atomic="true" className="sr-only">
-        {normalizedWords[visibleIndex]}
+        {reduceMotion ? staticWord : normalizedWords[visibleIndex]}
       </span>
-      <span aria-hidden="true" className="relative inline-flex h-[1.2em] overflow-hidden">
+      {reduceMotion ? (
+        <span aria-hidden="true" className="leading-[1.2]">
+          {staticWord}
+        </span>
+      ) : (
+        <span aria-hidden="true" className="relative inline-flex h-[1.2em] overflow-hidden">
         <span
           className="flex flex-col transition-transform duration-500 ease-out will-change-transform"
           style={{ transform: `translateY(-${visibleIndex * 100}%)` }}
@@ -54,7 +70,8 @@ export function FlipWords({ words, className, duration = 2500 }: FlipWordsProps)
             </span>
           ))}
         </span>
-      </span>
+        </span>
+      )}
     </span>
   );
 }

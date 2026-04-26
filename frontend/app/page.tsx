@@ -1,13 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { FlipWords } from "@/components/ui/FlipWords";
-import { FloatingDock } from "@/components/ui/FloatingDock";
-import { FocusCards } from "@/components/ui/FocusCards";
 import { TextGenerateEffect } from "@/components/ui/TextGenerateEffect";
 import { ClusterSimulation } from "@/components/simulation/ClusterSimulation";
 import { useSimulationSocket } from "@/lib/useSimulationSocket";
-import type { DockItem, FocusCard } from "@/components/ui/types";
+import type { DockItem } from "@/components/ui/types";
 
 type TelemetrySnapshot = {
   step: number;
@@ -23,6 +21,7 @@ type TaskCard = {
   difficulty: "Easy" | "Medium" | "Hard" | "Expert";
   description: string;
   score: number;
+  grading: string;
 };
 
 type MetricFigure = {
@@ -31,18 +30,45 @@ type MetricFigure = {
   caption: string;
 };
 
-const DEPLOYMENT_LIVE = false;
+type DetailCard = {
+  title: string;
+  detail: string;
+};
+
+type FeatureRow = {
+  title: string;
+  descriptor: string;
+  dotClassName: string;
+};
+
+type RewardTerm = {
+  formula: string;
+  label: string;
+  weight: number;
+  tone: string;
+};
 
 const HERO_FLIP_WORDS = ["adaptive", "resilient", "autonomous", "modern"];
 
-const DOCK_ITEMS: DockItem[] = [
+const NAV_ITEMS: DockItem[] = [
   {
-    title: "Home",
+    title: "About",
     href: "#about",
     icon: ({ className }) => (
       <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="1.8">
         <path d="M3 11.5 12 4l9 7.5" />
         <path d="M5.5 10.5V20h13V10.5" />
+      </svg>
+    ),
+  },
+  {
+    title: "Metrics",
+    href: "#metrics",
+    icon: ({ className }) => (
+      <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="1.8">
+        <path d="M5 19V9" />
+        <path d="M12 19V5" />
+        <path d="M19 19v-7" />
       </svg>
     ),
   },
@@ -75,8 +101,8 @@ const DOCK_ITEMS: DockItem[] = [
     ),
   },
   {
-    title: "Metrics",
-    href: "#metrics",
+    title: "Diagnostics",
+    href: "#diagnostics",
     icon: ({ className }) => (
       <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="1.8">
         <rect x="3.5" y="3.5" width="17" height="17" rx="2.5" />
@@ -86,7 +112,7 @@ const DOCK_ITEMS: DockItem[] = [
   },
   {
     title: "Try It",
-    href: "#try",
+    href: "#try-it",
     icon: ({ className }) => (
       <svg viewBox="0 0 24 24" className={className} fill="none" stroke="currentColor" strokeWidth="1.8">
         <path d="m5 19 14-7L5 5v5l8 2-8 2z" />
@@ -95,80 +121,103 @@ const DOCK_ITEMS: DockItem[] = [
   },
 ];
 
+const OBSERVABILITY_CARDS: DetailCard[] = [
+  {
+    title: "cpu_loads",
+    detail:
+      "Per-node CPU utilization in [0.0, 1.0], with -1.0 used when telemetry times out.",
+  },
+  {
+    title: "queue_lengths",
+    detail:
+      "Pending request counts per node, which expose pressure before outright failure.",
+  },
+  {
+    title: "latency_ms + p99_latency",
+    detail:
+      "Rolling end-to-end and tail latency so policies must control both average flow and spikes.",
+  },
+  {
+    title: "task_hint + task_score",
+    detail:
+      "A natural-language objective hint plus a live benchmark score on every step.",
+  },
+];
+
+const FEATURE_ROWS: FeatureRow[] = [
+  {
+    title: "Stochastic Traffic",
+    descriptor: "Burst-prone Gaussian arrivals",
+    dotClassName: "bg-amber-400",
+  },
+  {
+    title: "Non-Linear Latency",
+    descriptor: "Penalty grows with CPU²",
+    dotClassName: "bg-sky-400",
+  },
+  {
+    title: "Cascading Load Redistribution",
+    descriptor: "Mesh neighbor collapse",
+    dotClassName: "bg-white",
+  },
+  {
+    title: "Deterministic Failure",
+    descriptor: "90% CPU for 3 steps",
+    dotClassName: "bg-red-400",
+  },
+];
+
 const TASKS: TaskCard[] = [
   {
-    name: "Task 1 - Traffic Spike Recovery",
+    name: "Traffic Spike Recovery",
     difficulty: "Easy",
-    description:
-      "Handles a 3x request surge while keeping latency under 50ms without wasting actions.",
+    description: "",
     score: 0.09,
+    grading: "",
   },
   {
-    name: "Task 2 - Single Node Failure",
+    name: "Single Node Failure",
     difficulty: "Medium",
-    description:
-      "Repairs a failed node under pressure while preserving uptime and minimizing MTTR penalties.",
+    description: "",
     score: 0.05,
+    grading: "",
   },
   {
-    name: "Task 3 - Cascading Failure Prevention",
+    name: "Cascading Failure Prevention",
     difficulty: "Hard",
-    description:
-      "Must proactively reroute load before thermal hotspots trigger chain-collapse behavior.",
+    description: "",
     score: 0.31,
+    grading: "",
   },
   {
-    name: "Task 4 - Flash Crowd Meltdown",
+    name: "Flash Crowd Meltdown",
     difficulty: "Expert",
-    description:
-      "A 5x traffic event where survival demands precise throttle and scale timing under scarcity.",
+    description: "",
     score: 0,
+    grading: "",
   },
 ];
 
-const FEATURE_CARDS: FocusCard[] = [
-  {
-    title: "Forest Adventure",
-    src: "https://images.unsplash.com/photo-1518710843675-2540dd79065c?q=80&w=3387&auto=format&fit=crop",
-  },
-  {
-    title: "Valley of life",
-    src: "https://images.unsplash.com/photo-1600271772470-bd22a42787b3?q=80&w=3072&auto=format&fit=crop",
-  },
-  {
-    title: "Sala behta hi jayega",
-    src: "https://images.unsplash.com/photo-1505142468610-359e7d316be0?q=80&w=3070&auto=format&fit=crop",
-  },
-  {
-    title: "Camping is for pros",
-    src: "https://images.unsplash.com/photo-1486915309851-b0cc1f8a0084?q=80&w=3387&auto=format&fit=crop",
-  },
-  {
-    title: "The road not taken",
-    src: "https://images.unsplash.com/photo-1507041957456-9c397ce39c97?q=80&w=3456&auto=format&fit=crop",
-  },
-  {
-    title: "The First Rule",
-    src: "https://assets.aceternity.com/the-first-rule.png",
-  },
+const REWARD_TERMS: RewardTerm[] = [
+  { formula: "+0.40 × uptime_ratio", label: "dominant signal", weight: 0.4, tone: "bg-emerald-400" },
+  { formula: "−0.30 × normalized_latency", label: "latency penalty", weight: 0.3, tone: "bg-red-400" },
+  { formula: "−0.20 × overload_fraction", label: "hot-node penalty", weight: 0.2, tone: "bg-zinc-400" },
+  { formula: "−0.10 × actions / max_steps", label: "anti-spam tax", weight: 0.1, tone: "bg-zinc-500" },
+  { formula: "+0.50 × cascade_prevented_bonus", label: "prevention bonus", weight: 0.5, tone: "bg-emerald-300" },
 ];
 
-const TASK_CARDS: FocusCard[] = [
+const QUICKSTART_STEPS = [
   {
-    title: "Traffic Spike Recovery",
-    src: "https://images.unsplash.com/photo-1498050108023-c5249f4df085?q=80&w=3272&auto=format&fit=crop",
+    label: "Install Dependencies",
+    command: "pip install -r requirements.txt",
   },
   {
-    title: "Single Node Failure",
-    src: "https://images.unsplash.com/photo-1562813733-b31f71025d54?q=80&w=3270&auto=format&fit=crop",
+    label: "Start API Server",
+    command: "uvicorn server.app:app --host 0.0.0.0 --port 8000",
   },
   {
-    title: "Cascading Failure Prevention",
-    src: "https://images.unsplash.com/photo-1518773553398-650c184e0bb3?q=80&w=3272&auto=format&fit=crop",
-  },
-  {
-    title: "Flash Crowd Meltdown",
-    src: "https://images.unsplash.com/photo-1461749280684-dccba630e2f6?q=80&w=3270&auto=format&fit=crop",
+    label: "Run Inference",
+    command: "python inference.py",
   },
 ];
 
@@ -176,22 +225,22 @@ const METRIC_FIGURES: MetricFigure[] = [
   {
     src: "/metrics/fig1_vanishing_gradient_fix.png",
     title: "Fig 1: Vanishing Gradient Fix",
-    caption: "Stabilized training signal and improved optimization behavior.",
+    caption: "Shows the reward-shaping change used to keep latency penalties informative instead of flattening into a dead training signal.",
   },
   {
     src: "/metrics/fig2_cascade_exploit_fix.png",
     title: "Fig 2: Cascade Exploit Fix",
-    caption: "Mitigates exploit dynamics in cascading-failure conditions.",
+    caption: "Illustrates the protection against oscillation-based reward farming in cascading-failure scenarios.",
   },
   {
     src: "/metrics/fig3_cost_latency_coupling.png",
     title: "Fig 3: Cost-Latency Coupling",
-    caption: "Shows tradeoff frontier between resource cost and service latency.",
+    caption: "Maps how capacity cost and service latency move together when the policy tries to stabilize the cluster efficiently.",
   },
   {
     src: "/metrics/fig4_curiosity_annealing.png",
     title: "Fig 4: Curiosity Annealing",
-    caption: "Annealing schedule effect on exploration vs. stability.",
+    caption: "Visualizes how intrinsic exploration pressure decays as the agent shifts from discovery toward stable control.",
   },
 ];
 
@@ -235,17 +284,18 @@ function RevealSection({
     <section
       id={id}
       ref={ref}
-      className={`scroll-mt-28 transition-all duration-700 motion-reduce:transform-none motion-reduce:opacity-100 ${visible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
-        } ${className ?? ""}`}
+      className={`landing-section scroll-mt-28 transition-all duration-700 motion-reduce:transform-none motion-reduce:opacity-100 ${
+        visible ? "translate-y-0 opacity-100" : "translate-y-4 opacity-0"
+      } ${className ?? ""}`}
     >
-      {children}
+      <div className="section-inner">{children}</div>
     </section>
   );
 }
 
 function SectionDivider({ label }: { label: string }) {
   return (
-    <div className="my-16 sm:my-20" aria-hidden="true">
+    <div className="my-8 sm:my-10" aria-hidden="true">
       <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-4">
         <div className="h-px bg-gradient-to-r from-transparent via-zinc-800 to-zinc-700/50" />
         <span className="rounded-full border border-zinc-800 bg-zinc-950 px-3 py-1 font-mono text-[11px] tracking-[0.16em] text-zinc-500">
@@ -259,20 +309,20 @@ function SectionDivider({ label }: { label: string }) {
 
 function DifficultyBadge({ difficulty }: { difficulty: TaskCard["difficulty"] }) {
   const tone = {
-    Easy: "border-emerald-500/40 bg-emerald-500/10 text-emerald-300",
-    Medium: "border-amber-500/40 bg-amber-500/10 text-amber-300",
-    Hard: "border-orange-500/40 bg-orange-500/10 text-orange-300",
-    Expert: "border-pink-500/40 bg-pink-500/10 text-pink-300",
+    Easy: "bg-[#22c55e]/10 text-[#22c55e]",
+    Medium: "bg-[#3b82f6]/10 text-[#3b82f6]",
+    Hard: "bg-[#f97316]/10 text-[#f97316]",
+    Expert: "bg-[#ef4444]/10 text-[#ef4444]",
   }[difficulty];
 
-  return <span className={`rounded-full border px-2.5 py-1 text-xs font-mono ${tone}`}>[{difficulty}]</span>;
+  return <span className={`rounded-full px-2.5 py-1 text-xs font-mono ${tone}`}>{difficulty}</span>;
 }
 
 function Spotlight() {
   return (
-    <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10 overflow-hidden">
+    <div aria-hidden="true" className="pointer-events-none absolute inset-0 -z-10 overflow-x-clip">
       <div className="absolute left-1/2 top-[-12rem] h-[28rem] w-[28rem] -translate-x-1/2 rounded-full bg-[radial-gradient(circle,rgba(251,146,60,0.28),transparent_62%)]" />
-      <div className="absolute right-[-8rem] top-12 h-[26rem] w-[26rem] rounded-full bg-[radial-gradient(circle,rgba(236,72,153,0.22),transparent_68%)]" />
+      <div className="absolute right-[-11rem] top-12 h-[26rem] w-[26rem] rounded-full bg-[radial-gradient(circle,rgba(236,72,153,0.16),transparent_70%)]" />
       <div className="absolute bottom-[-12rem] left-[-10rem] h-[24rem] w-[24rem] rounded-full bg-[radial-gradient(circle,rgba(249,115,22,0.18),transparent_65%)]" />
     </div>
   );
@@ -280,7 +330,7 @@ function Spotlight() {
 
 function HeroWordmark() {
   return (
-    <div className="mt-5 flex flex-wrap items-end gap-x-3 gap-y-2 text-[20vw] font-black leading-[0.82] tracking-[-0.06em] md:text-[10vw]">
+    <div className="mt-5 flex flex-wrap items-end gap-x-3 gap-y-2 text-[clamp(4.4rem,18vw,12rem)] font-black leading-[0.82] tracking-[-0.05em]">
       <span className="bg-gradient-to-b from-white via-orange-100 to-pink-300 bg-clip-text text-transparent [text-shadow:0_0_26px_rgba(251,146,60,0.22)]">
         DIME
       </span>
@@ -295,55 +345,122 @@ function AnimatedHeading({ words, className }: { words: string; className?: stri
   return (
     <TextGenerateEffect
       words={words}
-      className={`mt-4 text-4xl font-black leading-[0.95] tracking-[-0.03em] text-zinc-100 [text-shadow:0_0_24px_rgba(244,114,182,0.18)] sm:text-6xl ${className ?? ""}`}
+      className={`mt-4 text-3xl font-black leading-[0.98] tracking-[-0.02em] text-zinc-100 [text-shadow:0_0_24px_rgba(244,114,182,0.18)] sm:text-5xl lg:text-6xl ${
+        className ?? ""
+      }`}
       duration={900}
       filter={false}
     />
   );
 }
 
-function parseTelemetry(payload: unknown): TelemetrySnapshot | null {
-  if (!payload || typeof payload !== "object") return null;
+function TopNavigation() {
+  return (
+    <header className="fixed inset-x-0 top-4 z-50 px-3 sm:px-5">
+      <div className="mx-auto flex w-full max-w-6xl items-center justify-between gap-3 rounded-[1.6rem] border border-white/12 bg-black/55 px-3 py-3 shadow-[0_18px_80px_rgba(0,0,0,0.45)] backdrop-blur-2xl">
+        <a href="#about" className="shrink-0 rounded-full border border-orange-400/20 bg-orange-500/10 px-3 py-2 font-mono text-xs tracking-[0.22em] text-orange-200">
+          DIME
+        </a>
+        <nav className="hero-nav-scroll flex min-w-0 flex-1 items-center justify-end gap-1 overflow-x-auto">
+          {NAV_ITEMS.map((item) => (
+            <a
+              key={`top-${item.href}-${item.title}`}
+              href={item.href}
+              className="group whitespace-nowrap rounded-full px-3 py-2 text-xs font-medium text-zinc-300 transition-all duration-300 hover:bg-white/8 hover:text-white"
+            >
+              <span className="relative">
+                {item.title}
+                <span className="absolute inset-x-0 -bottom-1 h-px origin-left scale-x-0 bg-gradient-to-r from-orange-300 via-pink-300 to-transparent transition-transform duration-300 group-hover:scale-x-100" />
+              </span>
+            </a>
+          ))}
+        </nav>
+      </div>
+    </header>
+  );
+}
 
-  const candidate = payload as Record<string, unknown>;
-  const source =
-    (candidate.observation as Record<string, unknown> | undefined) ??
-    (candidate.data as Record<string, unknown> | undefined) ??
-    candidate;
+function DetailGrid({ cards, columns = "lg:grid-cols-2" }: { cards: DetailCard[]; columns?: string }) {
+  return (
+    <div className={`grid grid-cols-1 gap-4 sm:grid-cols-2 ${columns}`}>
+      {cards.map((card) => (
+        <article
+          key={card.title}
+          className="group h-full rounded-2xl border border-zinc-800/85 bg-gradient-to-b from-zinc-950 to-zinc-950/70 p-4 shadow-[0_0_30px_rgba(251,146,60,0.04)] transition-all duration-300 hover:-translate-y-1 hover:border-zinc-700 hover:shadow-[0_18px_40px_rgba(0,0,0,0.35)] sm:p-5"
+        >
+          <div className="flex h-full flex-col gap-2.5">
+            <p className="font-mono text-[11px] tracking-[0.16em] text-zinc-500">{card.title}</p>
+            <p className="text-sm leading-5 text-zinc-300">{card.detail}</p>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
 
-  const cpuLoadsRaw = source.cpu_loads ?? source.cpuLoads;
-  const queueLengthsRaw = source.queue_lengths ?? source.queueLengths;
-  const failedNodesRaw = source.failed_nodes ?? source.failedNodes;
-  const latencyRaw = source.latency_ms ?? source.latencyMs;
-  const requestRateRaw = source.request_rate ?? source.requestRate;
-  const stepRaw = source.step;
+function FeatureEditorialList() {
+  return (
+    <div className="mt-12">
+      {FEATURE_ROWS.map((feature) => (
+        <div key={feature.title} className="mb-7">
+          <div className="grid grid-cols-[auto_1fr_auto] items-center gap-4">
+            <div className="flex items-center gap-3">
+              <span className={`h-2 w-2 rounded-full ${feature.dotClassName}`} />
+              <p className="text-2xl font-bold text-white md:text-3xl">{feature.title}</p>
+            </div>
+            <div className="border-b border-dotted border-zinc-800" />
+            <p className="text-right font-mono text-sm text-zinc-500">{feature.descriptor}</p>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
 
-  if (!Array.isArray(cpuLoadsRaw) || !Array.isArray(queueLengthsRaw) || !Array.isArray(failedNodesRaw)) {
-    return null;
-  }
+function TaskBenchmarkList() {
+  const { ref, visible } = useRevealOnScroll<HTMLDivElement>();
 
-  const cpuLoads = cpuLoadsRaw.map((value) => Number(value)).filter((value) => Number.isFinite(value));
-  const queueLengths = queueLengthsRaw
-    .map((value) => Number(value))
-    .filter((value) => Number.isFinite(value));
-  const failedNodes = failedNodesRaw.map((value) => Number(value)).filter((value) => Number.isFinite(value));
+  return (
+    <div ref={ref} className="mt-10 divide-y divide-zinc-900 border-y border-zinc-900">
+      {TASKS.map((task, index) => (
+        <article key={task.name} className="flex flex-col gap-4 py-5 md:flex-row md:items-center">
+          <div className="flex min-w-0 flex-1 items-center gap-4">
+            <span className="w-6 font-mono text-sm text-zinc-600">{String(index + 1).padStart(2, "0")}</span>
+            <p className="min-w-0 text-lg font-medium text-white">{task.name}</p>
+          </div>
+          <div className="flex items-center justify-end gap-4">
+            <DifficultyBadge difficulty={task.difficulty} />
+            <div className="h-1 w-20 rounded-full bg-zinc-800">
+              <div
+                className="h-1 rounded-full bg-zinc-400 transition-[width] duration-1000 ease-out"
+                style={{
+                  width: visible ? `${Math.max(0, task.score * 100)}%` : "0%",
+                  transitionDelay: `${index * 140}ms`,
+                }}
+              />
+            </div>
+            <span className="min-w-10 text-right font-mono text-xs text-zinc-500">{task.score.toFixed(2)}</span>
+          </div>
+        </article>
+      ))}
+    </div>
+  );
+}
 
-  const latencyMs = Number(latencyRaw);
-  const requestRate = Number(requestRateRaw);
-  const step = Number(stepRaw);
-
-  if (!Number.isFinite(latencyMs) || !Number.isFinite(requestRate) || !Number.isFinite(step)) {
-    return null;
-  }
-
-  return {
-    step,
-    cpuLoads,
-    queueLengths,
-    latencyMs,
-    failedNodes,
-    requestRate,
-  };
+function RewardWeightMeter() {
+  return (
+    <div className="space-y-8">
+      {REWARD_TERMS.map((term) => (
+        <div key={term.formula}>
+          <p className="font-mono text-sm text-zinc-200">{term.formula}</p>
+          <div className="mt-3 h-0.5 w-full max-w-xs bg-zinc-900">
+            <div className={`h-0.5 rounded-full ${term.tone}`} style={{ width: `${(term.weight / 0.5) * 100}%` }} />
+          </div>
+          <p className="mt-2 font-mono text-xs text-zinc-500">{term.label}</p>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 function useAnimatedFallback(): TelemetrySnapshot {
@@ -378,6 +495,31 @@ function useAnimatedFallback(): TelemetrySnapshot {
   }, []);
 
   return snapshot;
+}
+
+function ScrollProgress() {
+  const [progress, setProgress] = useState(0);
+
+  useEffect(() => {
+    const onScroll = () => {
+      const max = document.documentElement.scrollHeight - window.innerHeight;
+      const value = max > 0 ? Math.min(1, Math.max(0, window.scrollY / max)) : 0;
+      setProgress(value);
+    };
+
+    onScroll();
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => window.removeEventListener("scroll", onScroll);
+  }, []);
+
+  return (
+    <div className="fixed inset-x-0 top-0 z-[70] h-[2px] bg-transparent">
+      <div
+        className="h-full bg-gradient-to-r from-orange-300 via-rose-300 to-amber-200 transition-[width] duration-200"
+        style={{ width: `${progress * 100}%` }}
+      />
+    </div>
+  );
 }
 
 export default function Home() {
@@ -416,77 +558,114 @@ export default function Home() {
 
   return (
     <div className="relative min-h-screen bg-[#080808] text-white">
-      <FloatingDock items={DOCK_ITEMS} className="bottom-6" mobileClassName="bottom-4" />
+      <ScrollProgress />
+      <TopNavigation />
 
-      <main className="relative mx-auto max-w-7xl px-5 pb-24 pt-24 sm:px-8 sm:pt-28">
+      <main className="relative pb-24">
         <section
           id="about"
-          className="relative grid min-h-screen scroll-mt-28 items-center gap-12 pb-14 md:grid-cols-12"
+          className="relative min-h-screen scroll-mt-28 overflow-x-clip pt-28 sm:pt-32"
         >
-          <Spotlight />
+          <div className="section-inner">
+            <div className="relative grid min-h-screen items-center gap-8 md:grid-cols-12">
+              <Spotlight />
 
-          <div className="md:col-span-7">
-            <p className="font-mono text-xs tracking-[0.2em] text-orange-300">[ SRE BENCHMARK ]</p>
-            <HeroWordmark />
-            <p className="mt-4 max-w-2xl text-xl text-zinc-200 sm:text-2xl">
-              Distributed Infrastructure Management Environment
-            </p>
-            <p className="mt-5 max-w-2xl text-base leading-7 text-zinc-400 sm:text-lg">
-              A high-fidelity simulated distributed system for training and evaluating LLM agents on
-              complex Site Reliability Engineering tasks. Built on the OpenEnv framework.
-            </p>
-            <a
-              href="#try"
-              className="mt-8 inline-flex items-center rounded-md border border-orange-400/40 bg-orange-500/10 px-5 py-3 font-mono text-sm text-orange-100 transition-colors hover:border-pink-400/50 hover:bg-pink-500/10"
-            >
-              Jump to Live Access -&gt;
-            </a>
-          </div>
+              <div className="md:col-span-7">
+                <p className="font-mono text-xs tracking-[0.2em] text-orange-300">[ SRE BENCHMARK ]</p>
+                <HeroWordmark />
+                <p className="mt-4 max-w-2xl text-xl text-zinc-200 sm:text-2xl">Distributed infra benchmark for autonomous SRE agents.</p>
+                <a
+                  href="#try"
+                  className="mt-8 inline-flex items-center rounded-md border border-orange-400/40 bg-orange-500/10 px-5 py-3 font-mono text-sm text-orange-100 transition-colors hover:border-pink-400/50 hover:bg-pink-500/10"
+                >
+                  Jump to Live Access -&gt;
+                </a>
 
-          <div className="md:col-span-5 md:pl-6">
-            <div className="rounded-xl border border-zinc-700 bg-zinc-950/95 p-5 font-mono text-sm shadow-[0_0_40px_rgba(251,146,60,0.08)]">
-              <p className="text-zinc-500">● NODE STATUS  [step: {telemetry?.step ?? "--"}]</p>
-              <div className="mt-4 space-y-2">
-                <p className="text-zinc-400">
-                  cpu_loads      <span className="text-emerald-300">[{telemetry ? telemetry.cpuLoads.join(", ") : "loading"}]</span>
-                </p>
-                <p className="text-zinc-400">
-                  queue_lengths  <span className="text-orange-300">[{telemetry ? telemetry.queueLengths.join(", ") : "loading"}]</span>
-                </p>
-                <p className="text-zinc-400">
-                  latency_ms     <span className="text-pink-300">{telemetry ? `${telemetry.latencyMs.toFixed(1)}ms` : "loading"}</span>
-                </p>
-                <p className="text-zinc-400">
-                  failed_nodes   <span className="text-red-300">[{telemetry ? telemetry.failedNodes.join(", ") : "loading"}]</span>
-                </p>
-                <p className="text-zinc-400">
-                  request_rate   <span className="text-amber-200">{telemetry ? `${telemetry.requestRate.toFixed(0)} req/s` : "loading"}</span>
-                </p>
+                <div className="mt-12 max-w-[460px] rounded-xl border border-zinc-700 bg-zinc-950/95 p-4 font-mono text-xs shadow-[0_0_40px_rgba(251,146,60,0.08)]">
+                  <p className="text-emerald-300/80">● LIVE BASELINES</p>
+                  <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 text-[11px] sm:text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-zinc-600">#1</span>
+                      <span className="text-white">Qwen3-8B</span>
+                      <span className="text-emerald-300">0.31</span>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="text-zinc-600">#2</span>
+                      <span className="text-white">Llama-3.1-8B</span>
+                      <span className="text-amber-300">0.09</span>
+                    </div>
+                    <a href="#try-it" className="text-emerald-300/80 transition-colors hover:text-emerald-200">
+                      submit your agent -&gt;
+                    </a>
+                  </div>
+                </div>
               </div>
 
-              {telemetryError ? (
-                <p className="mt-4 text-xs text-pink-300">telemetry warning: {telemetryError}</p>
-              ) : null}
+              <div className="md:col-span-5 md:pl-6">
+                <div className="rounded-xl border border-zinc-800 bg-zinc-950/95 p-5 font-mono text-sm shadow-[0_0_40px_rgba(251,146,60,0.08)]">
+                  <p className="text-zinc-500">● NODE STATUS  [step: {telemetry?.step ?? "--"}]</p>
+                  <div className="mt-4 space-y-2">
+                    <p className="grid grid-cols-[auto_1fr] gap-3 text-zinc-400">
+                      <span>cpu_loads</span>
+                      <span className="min-w-0 break-words text-emerald-300">[{telemetry ? telemetry.cpuLoads.join(", ") : "loading"}]</span>
+                    </p>
+                    <p className="grid grid-cols-[auto_1fr] gap-3 text-zinc-400">
+                      <span>queue_lengths</span>
+                      <span className="min-w-0 break-words text-orange-300">[{telemetry ? telemetry.queueLengths.join(", ") : "loading"}]</span>
+                    </p>
+                    <p className="grid grid-cols-[auto_1fr] gap-3 text-zinc-400">
+                      <span>latency_ms</span>
+                      <span className="text-pink-300">{telemetry ? `${telemetry.latencyMs.toFixed(1)}ms` : "loading"}</span>
+                    </p>
+                    <p className="grid grid-cols-[auto_1fr] gap-3 text-zinc-400">
+                      <span>failed_nodes</span>
+                      <span className="min-w-0 break-words text-red-300">[{telemetry ? telemetry.failedNodes.join(", ") : "loading"}]</span>
+                    </p>
+                    <p className="grid grid-cols-[auto_1fr] gap-3 text-zinc-400">
+                      <span>request_rate</span>
+                      <span className="text-amber-200">{telemetry ? `${telemetry.requestRate.toFixed(0)} req/s` : "loading"}</span>
+                    </p>
+                  </div>
+
+                  {telemetryError ? (
+                    <p className="mt-4 text-xs text-pink-300">telemetry warning: {telemetryError}</p>
+                  ) : null}
+                </div>
+              </div>
+
+              <div className="md:col-span-12 pt-2">
+                {showScrollCue ? (
+                  <div className="relative mt-4 text-center font-mono text-xs tracking-[0.18em] text-zinc-500 transition-all duration-300">
+                    ↓ scroll to explore
+                  </div>
+                ) : null}
+              </div>
             </div>
-          </div>
-
-          <div className="md:col-span-12 pt-2">
-            {showScrollCue ? (
-              <div className="relative mt-4 text-center font-mono text-xs tracking-[0.18em] text-zinc-500 transition-all duration-300">
-                ↓ scroll to explore
-              </div>
-            ) : null}
           </div>
         </section>
 
+        <SectionDivider label="OBSERVABILITY" />
+
+        <RevealSection id="metrics">
+          <p className="font-mono text-xs tracking-[0.2em] text-emerald-300">[ AGENT INPUT METRICS ]</p>
+          <AnimatedHeading words="The Signals an Agent Sees" />
+          <TextGenerateEffect
+            words="Observation fields come directly from the environment state, task curriculum, and partial-observability sandbox."
+            className="mt-3 text-xs uppercase tracking-[0.14em] text-zinc-500 sm:text-sm"
+          />
+          <div className="mt-8 sm:mt-10">
+            <DetailGrid cards={OBSERVABILITY_CARDS} />
+          </div>
+        </RevealSection>
+
         <SectionDivider label="LIVE SYSTEM" />
 
-        <RevealSection id="simulation" className="mt-10">
+        <RevealSection id="simulation">
           <p className="font-mono text-xs tracking-[0.2em] text-sky-300">[ REAL-TIME CLUSTER TOPOLOGY ]</p>
           <AnimatedHeading words="Watch DIME Evolve Step by Step" />
           <TextGenerateEffect
             words="Native React Flow vectors, motion-interpolated node states, and live WebSocket telemetry from the Python simulator."
-            className="mt-3 text-sm uppercase tracking-[0.14em] text-zinc-500"
+            className="mt-3 text-xs uppercase tracking-[0.14em] text-zinc-500 sm:text-sm"
           />
           <div className="mt-10">
             <ClusterSimulation />
@@ -495,94 +674,38 @@ export default function Home() {
 
         <SectionDivider label="DYNAMICS" />
 
-        <RevealSection id="features" className="mt-8">
+        <RevealSection id="features">
           <p className="font-mono text-xs tracking-[0.2em] text-orange-300">[ SIMULATION DYNAMICS ]</p>
           <AnimatedHeading words="What Makes DIME Hard" />
-          <TextGenerateEffect words="Constraint-driven incidents with compounding latency and brittle recovery windows." className="mt-3 text-sm uppercase tracking-[0.14em] text-zinc-500" />
+          <FeatureEditorialList />
 
-          <div className="mt-12">
-            <FocusCards cards={FEATURE_CARDS} />
-          </div>
-
-          <div className="mt-20">
+          <div className="mt-14 sm:mt-16">
             <AnimatedHeading words="Four Tasks. One Unforgiving Benchmark." className="text-3xl sm:text-5xl" />
-            <TextGenerateEffect words="Each task shifts failure modes so policies must adapt instead of memorizing." className="mt-3 text-sm uppercase tracking-[0.14em] text-zinc-500" />
-            <div className="mt-9">
-              <FocusCards cards={TASK_CARDS} className="lg:grid-cols-2" />
-            </div>
-
-            <div className="mt-8 grid grid-cols-1 gap-4 lg:grid-cols-2">
-              {TASKS.map((task) => (
-                <article key={task.name} className="rounded-xl border border-zinc-800 bg-zinc-950/90 p-5">
-                  <div className="flex items-start justify-between gap-3">
-                    <p className="text-base font-semibold text-zinc-100">{task.name}</p>
-                    <DifficultyBadge difficulty={task.difficulty} />
-                  </div>
-                  <p className="mt-3 text-sm text-zinc-400">{task.description}</p>
-                  <div className="mt-4">
-                    <div className="flex items-center justify-between font-mono text-xs text-zinc-500">
-                      <span>Llama-3.1-8B Baseline</span>
-                      <span>{task.score.toFixed(3)}</span>
-                    </div>
-                    <div className="mt-2 h-2 rounded-full bg-zinc-900">
-                      <div
-                        className={`h-2 rounded-full ${task.score > 0.2 ? "bg-orange-400" : "bg-pink-500"}`}
-                        style={{ width: `${Math.max(1, task.score * 100)}%` }}
-                      />
-                    </div>
-                  </div>
-                </article>
-              ))}
-            </div>
+            <TaskBenchmarkList />
           </div>
         </RevealSection>
 
         <SectionDivider label="SCORING" />
 
-        <RevealSection id="reward" className="mt-10">
+        <RevealSection id="reward">
           <p className="font-mono text-xs tracking-[0.2em] text-pink-300">[ REWARD SIGNAL ]</p>
           <AnimatedHeading words="How DIME Scores an Agent" />
-          <TextGenerateEffect words="Dense per-step feedback rewards stability, penalizes latency, and discourages noisy interventions." className="mt-3 text-sm uppercase tracking-[0.14em] text-zinc-500" />
 
           <div className="mt-12 grid grid-cols-1 gap-8 lg:grid-cols-12">
             <div className="lg:col-span-7">
-              <p className="max-w-3xl text-zinc-400">
-                DIME uses a dense, step-level continuous reward signal, not sparse end-of-episode
-                rewards. This means the agent gets feedback every step, making it trainable via RL.
-              </p>
-              <ul className="mt-6 space-y-4 text-zinc-400">
-                <li>
-                  <span className="font-mono text-zinc-100">+0.40 x uptime_ratio</span> - Keeps nodes
-                  alive. The dominant signal.
-                </li>
-                <li>
-                  <span className="font-mono text-zinc-100">-0.30 x normalized_latency</span> - Penalizes
-                  slow responses proportional to severity.
-                </li>
-                <li>
-                  <span className="font-mono text-zinc-100">-0.20 x overload_fraction</span> - Discourages
-                  ignoring hot nodes.
-                </li>
-                <li>
-                  <span className="font-mono text-zinc-100">-0.10 x (actions/max_steps)</span> - Action
-                  efficiency penalty. Spamming actions is punished.
-                </li>
-                <li>
-                  <span className="font-mono text-zinc-100">+0.50 x cascade_prevented_bonus</span> - The
-                  highest bonus. Prevention rewarded over recovery.
-                </li>
-              </ul>
+              <RewardWeightMeter />
             </div>
 
             <div className="lg:col-span-5">
               <div className="rounded-xl border border-zinc-800 bg-zinc-950 p-6 font-mono text-sm text-orange-200">
                 <div className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-2">
                   {[
-                    "R(t) = + 0.40 x uptime_ratio",
-                    "       - 0.30 x normalized_latency",
-                    "       - 0.20 x overload_fraction",
-                    "       - 0.10 x (actions_taken / max_steps)",
-                    "       + 0.50 x cascade_prevented_bonus",
+                    "step reward in [-5.0, +5.0]",
+                    "db failure => -5.0 terminal penalty",
+                    ">=80% failed nodes => -4.0 penalty",
+                    "rubric logs: format, stability, latency",
+                    "rubric logs: cascade, efficiency, throughput",
+                    "task graders compute live benchmark score",
                   ].map((line, idx) => (
                     <div key={`row-${idx}`} className="contents">
                       <span className="text-zinc-600">{String(idx + 1).padStart(2, "0")}</span>
@@ -597,10 +720,13 @@ export default function Home() {
 
         <SectionDivider label="METRICS" />
 
-        <RevealSection id="metrics" className="mt-10">
-          <p className="font-mono text-xs tracking-[0.2em] text-orange-300">[ EVALUATION METRICS ]</p>
+        <RevealSection id="diagnostics">
+          <p className="font-mono text-xs tracking-[0.2em] text-orange-300">[ BENCHMARK DIAGNOSTICS ]</p>
           <AnimatedHeading words="Benchmark Diagnostics" />
-          <TextGenerateEffect words="Core plots from DIME evaluation runs across failure, latency, and exploration regimes." className="mt-3 text-sm uppercase tracking-[0.14em] text-zinc-500" />
+          <TextGenerateEffect
+            words="Core plots from the repo show how DIME handles reward shaping, exploit resistance, cost-latency coupling, and exploration schedules."
+            className="mt-3 text-xs uppercase tracking-[0.14em] text-zinc-500 sm:text-sm"
+          />
 
           <div className="mt-12 grid grid-cols-1 gap-6 lg:grid-cols-2">
             {METRIC_FIGURES.map((figure) => (
@@ -615,83 +741,87 @@ export default function Home() {
           </div>
         </RevealSection>
 
+        <SectionDivider label="INSTALL" />
+
+        <RevealSection id="try-it">
+          <p className="font-mono text-xs tracking-[0.2em] text-emerald-300">[ QUICKSTART ]</p>
+          <AnimatedHeading words="Install + Run DIME" className="text-3xl sm:text-5xl" />
+          <p className="mt-5 font-mono text-xs text-zinc-500">
+            install deps  →  start server  →  run evaluation
+          </p>
+          <div className="mt-8 grid grid-cols-1 gap-3 md:grid-cols-3">
+            {QUICKSTART_STEPS.map((step, index) => (
+              <article
+                key={step.label}
+                className="rounded-xl border border-zinc-800 bg-zinc-950/75 p-4 shadow-[0_8px_30px_rgba(0,0,0,0.28)] transition-colors duration-300 hover:border-zinc-700"
+              >
+                <p className="font-mono text-[11px] tracking-[0.14em] text-zinc-500">
+                  STEP {String(index + 1).padStart(2, "0")}
+                </p>
+                <p className="mt-2 text-sm font-semibold text-zinc-100">{step.label}</p>
+                <div className="mt-3 rounded-md border border-zinc-800 bg-black/50 px-3 py-2 font-mono text-xs text-zinc-300">
+                  {step.command}
+                </div>
+              </article>
+            ))}
+          </div>
+        </RevealSection>
+
         <SectionDivider label="ACCESS" />
 
-        <RevealSection id="try" className="mt-10">
+        <RevealSection id="try">
           <p className="font-mono text-xs tracking-[0.2em] text-pink-300">[ LIVE ACCESS ]</p>
           <div className="mt-5 max-w-4xl md:ml-10">
-            <AnimatedHeading words="Try Your Hands On DIME" className="text-center md:text-left" />
-            <TextGenerateEffect
-              words="Use the hosted space for quick validation or run the container locally for controlled experiments."
-              className="mt-3 text-center text-sm uppercase tracking-[0.14em] text-zinc-500 md:text-left"
-            />
-            <p className="mt-5 max-w-3xl text-center text-zinc-400 md:text-left">
-              DIME is deployed as a containerized environment. You can interact with the live simulation
-              via the Hugging Face Space or pull the Docker image to run it locally.
-            </p>
+            <AnimatedHeading words="Try DIME" className="text-center md:text-left" />
 
             <div className="mt-8 flex flex-wrap items-center justify-center gap-3 md:justify-start">
-              <a
-                href="#"
-                className="inline-flex min-w-[230px] items-center justify-center rounded-md bg-gradient-to-r from-orange-300 to-pink-300 px-5 py-3 text-sm font-semibold text-black"
+              <button
+                type="button"
+                disabled
+                className="inline-flex min-w-[230px] cursor-not-allowed items-center justify-center rounded-md bg-gradient-to-r from-orange-300 to-pink-300 px-5 py-3 text-sm font-semibold text-black opacity-80"
               >
-                Open on Hugging Face -&gt;
-              </a>
+                Hugging Face Space
+              </button>
               <a
-                href="#"
-                className="inline-flex items-center justify-center rounded-md border border-zinc-700 px-4 py-3 font-mono text-sm text-zinc-200"
+                href="#try-it"
+                className="inline-flex min-w-[180px] items-center justify-center rounded-md border border-zinc-700 px-5 py-3 font-mono text-sm text-zinc-200 transition-colors hover:border-zinc-500 hover:text-white"
               >
-                Pull Docker Image
+                Run via Docker
               </a>
             </div>
 
-            <p className="mt-5 inline-block rounded border border-zinc-800 bg-zinc-950 px-3 py-2 font-mono text-xs text-zinc-600">
-              docker://registry-link-placeholder | hf://space-link-placeholder
-            </p>
-
-            <div className="mt-4 flex items-center gap-2 font-mono text-xs text-zinc-500">
-              <span
-                className={`inline-block h-2 w-2 rounded-full ${DEPLOYMENT_LIVE ? "animate-pulse bg-emerald-400" : "bg-amber-400"
-                  }`}
-              />
-              {DEPLOYMENT_LIVE ? "Simulation Online" : "Coming Soon"}
+            <div className="mt-6 inline-flex whitespace-pre-wrap rounded-xl border border-zinc-800 bg-zinc-950 px-4 py-3 font-mono text-xs text-zinc-400">
+              docker build -t distributed-infra-env .{"\n"}docker run -p 8000:8000 distributed-infra-env
             </div>
-            <p className="mt-2 text-sm text-zinc-500">Links will be updated when the deployment is live.</p>
           </div>
         </RevealSection>
       </main>
 
-      <footer className="border-t border-zinc-800 bg-zinc-950/35">
+      <div className="mx-auto max-w-7xl px-5 sm:px-8">
+        <div className="border-t border-zinc-800" />
+      </div>
+
+      <footer className="bg-zinc-950/35">
         <div className="mx-auto grid max-w-7xl grid-cols-1 gap-8 px-5 py-10 text-sm text-zinc-500 sm:px-8 lg:grid-cols-12">
-          <div className="lg:col-span-6">
+          <div className="lg:col-span-7">
             <p className="font-mono text-zinc-300">DIME</p>
             <p className="mt-3 max-w-2xl leading-7">
-              Distributed Infrastructure Management Environment is built for the OpenEnv Hackathon to
-              benchmark LLM agents against realistic SRE incident-response dynamics.
-            </p>
-            <p className="mt-3 font-mono text-xs tracking-wide text-zinc-600">
-              Co-organized by Meta, PyTorch and Hugging Face
+              Distributed Infrastructure Management Environment was built for the Meta Hackathon in
+              Bangalore 2026 under Meta and OpenEnv, with Hugging Face as the deployment surface.
             </p>
           </div>
 
-          <div className="lg:col-span-3">
-            <p className="font-mono text-xs tracking-[0.16em] text-zinc-400">BENCHMARK</p>
-            <p className="mt-3 text-zinc-400">Environment: distributed_infra_env</p>
-            <p className="mt-2 text-zinc-400">Modeled Tasks: 4 graded incidents</p>
-            <p className="mt-2 text-zinc-400">Reward: dense step-level signal</p>
-          </div>
-
-          <div className="lg:col-span-3">
+          <div className="lg:col-span-5">
             <p className="font-mono text-xs tracking-[0.16em] text-zinc-400">RESOURCES</p>
             <div className="mt-3 flex flex-col gap-2">
-              <a href="#" className="font-mono transition-colors hover:text-zinc-300">
-                Source Code
+              <a href="#about" className="font-mono transition-colors hover:text-zinc-300">
+                About DIME
               </a>
-              <a href="#" className="font-mono transition-colors hover:text-zinc-300">
-                Hugging Face Space
+              <a href="#reward" className="font-mono transition-colors hover:text-zinc-300">
+                Scoring Model
               </a>
-              <a href="#" className="font-mono transition-colors hover:text-zinc-300">
-                Docker Image
+              <a href="#try" className="font-mono transition-colors hover:text-zinc-300">
+                Hugging Face Access
               </a>
             </div>
           </div>

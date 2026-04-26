@@ -18,9 +18,22 @@ export function TextGenerateEffect({
 }: TextGenerateEffectProps) {
   const tokens = useMemo(() => words.trim().split(/\s+/).filter(Boolean), [words]);
   const [visibleCount, setVisibleCount] = useState(0);
+  const [reduceMotion, setReduceMotion] = useState(false);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const sync = () => setReduceMotion(media.matches);
+    sync();
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
 
   useEffect(() => {
     if (!tokens.length) return;
+    if (reduceMotion) {
+      setVisibleCount(tokens.length);
+      return;
+    }
 
     const perWordDelay = Math.max(35, Math.floor(duration / tokens.length));
     const timer = window.setInterval(() => {
@@ -34,7 +47,7 @@ export function TextGenerateEffect({
     }, perWordDelay);
 
     return () => window.clearInterval(timer);
-  }, [tokens, duration]);
+  }, [tokens, duration, reduceMotion]);
 
   return (
     <p className={cn("flex flex-wrap text-zinc-100", className)}>
