@@ -25,7 +25,6 @@ pinned: false
 <br>
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab?style=flat-square&logo=python&logoColor=white)](https://python.org)
-[![Model](https://img.shields.io/badge/🤗_Model-Qwen3--8B--DIME-ff6b35?style=flat-square)](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME)
 [![OpenEnv](https://img.shields.io/badge/OpenEnv-Meta_×_PyTorch_×_HuggingFace-cc0000?style=flat-square)](https://github.com/Naseer-010/DIME)
 [![License](https://img.shields.io/badge/License-MIT-22c55e?style=flat-square)](LICENSE)
 [![Hackathon](https://img.shields.io/badge/Hackathon-Global_2026-blueviolet?style=flat-square)]()
@@ -42,9 +41,9 @@ pinned: false
 
 <div align="center">
 
-| 📝 Blog Post | 🎥 Demo Video | 🌐 Live Next.js Demo | 🤗 HuggingFace |
-|:---:|:---:|:---:|:---:|
-| `coming soon` | `coming soon` | `coming soon` | [Qwen3-8B-Finetuned-DIME](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME) |
+| 📝 Research Paper | 🎥 Demo Video | 🌐 Live Next.js Demo |
+|:---:|:---:|:---:|
+| [DIME.pdf](https://drive.google.com/file/d/1SIoV8-UWNWY_Dj8ltbhaz8ZAIX75Nzg2/view?usp=sharing) | [YouTube](https://youtu.be/azl4ZAgVcLI) | `coming soon` |
 
 </div>
 
