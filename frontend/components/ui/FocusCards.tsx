@@ -1,6 +1,5 @@
 "use client";
 
-import Image from "next/image";
 import { useState } from "react";
 import { cn } from "./cn";
 import type { FocusCard } from "./types";
@@ -35,11 +34,9 @@ export function FocusCards({ cards, className }: FocusCardsProps) {
               blurred ? "opacity-60" : "opacity-100"
             )}
           >
-            <Image
+            <img
               src={card.src}
               alt={card.title}
-              fill
-              sizes="(min-width: 1024px) 33vw, (min-width: 640px) 50vw, 100vw"
               className={cn(
                 "h-full w-full object-cover transition-transform duration-500",
                 focused ? "scale-110" : "scale-100"

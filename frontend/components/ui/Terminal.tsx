@@ -22,7 +22,7 @@ export function Terminal({
   commands,
   outputs,
   typingSpeed = 26,
-  delayBetweenCommands = 400,
+  delayBetweenCommands = 450,
   className,
 }: TerminalProps) {
   const [lines, setLines] = useState<RenderedLine[]>([]);
@@ -41,39 +41,33 @@ export function Terminal({
   }, [commands, outputs]);
 
   useEffect(() => {
-    let running = true;
+    let cancelled = false;
 
     const run = async () => {
-      while (running) {
-        setLines([]);
-        setActiveLine(null);
+      setLines([]);
+      setActiveLine(null);
 
-        for (let i = 0; i < script.length; i += 1) {
-          const line = script[i];
-          const value = line.text ?? "";
+      for (let i = 0; i < script.length; i += 1) {
+        const line = script[i];
+        const value = line.text ?? "";
 
-          for (let c = 0; c <= value.length; c += 1) {
-            if (!running) return;
-            setActiveLine({ type: line.type, text: value.slice(0, c) });
-            await sleep(typingSpeed);
-          }
-
-          if (!running) return;
-          setLines((prev) => [...prev, line]);
-          setActiveLine(null);
-          await sleep(delayBetweenCommands);
+        for (let c = 0; c <= value.length; c += 1) {
+          if (cancelled) return;
+          setActiveLine({ type: line.type, text: value.slice(0, c) });
+          await sleep(typingSpeed);
         }
 
-        if (!running) return;
+        if (cancelled) return;
+        setLines((prev) => [...prev, line]);
         setActiveLine(null);
-        await sleep(2500);
+        await sleep(delayBetweenCommands);
       }
     };
 
     run();
 
     return () => {
-      running = false;
+      cancelled = true;
     };
   }, [script, typingSpeed, delayBetweenCommands]);
 
@@ -89,7 +83,7 @@ export function Terminal({
       >
         {isCommand ? "$ " : ""}
         {line.text}
-        {active ? <span className="ml-0.5 inline-block animate-pulse align-middle text-zinc-100">█</span> : null}
+        {active ? <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-white/90 align-middle" /> : null}
       </div>
     );
   };
