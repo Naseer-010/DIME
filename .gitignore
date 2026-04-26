@@ -9,19 +9,28 @@ venv/
 .venv/
 *.env
 .env
-outputs/
-logs/
-*.log
 .DS_Store
-OpenEnv/
-distributed_infra_env/
-pre_validate.sh
-test_venv/
-venv/
 
-# Model checkpoints and training artifacts (large binaries — distribute via tar)
+# Training artifacts and caches
 checkpoints/
 grpo_trainer_lora_model/
 unsloth_compiled_cache/
 *.tar
 *.tar.gz
+
+# Logs and metrics
+logs/
+*.log
+
+# Test artifacts
+test_venv/
+.pytest_cache/
+
+# OpenEnv / legacy
+OpenEnv/
+distributed_infra_env/
+outputs/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
