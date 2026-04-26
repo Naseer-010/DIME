@@ -10,7 +10,7 @@
 ╚═════╝ ╚═╝╚═╝     ╚═╝╚══════╝
 ```
 
-# Distributed Infrastructure Management Environment (DIME)
+<h1 align="center">Distributed Infrastructure Management Environment (DIME)</h1>
 
 **A physics-driven simulation of distributed infrastructure in a production environment where an LLM agent learns to act as an on-call SRE.** **It gets live telemetry. It issues real `kubectl` commands. Things break. It learns.**
 
@@ -23,6 +23,10 @@
 [![Hackathon](https://img.shields.io/badge/Hackathon-Global_2026-blueviolet?style=flat-square)]()
 
 *An OpenEnv submission · Meta × PyTorch × HuggingFace Global Hackathon · April 2026* *Naseer Hussain · Shivangi Sharma · Nithish Sri Ram*
+
+<p align="center">
+  <img src="frontend/public/ui/landing.jpg" alt="DIME landing UI" width="100%" />
+</p>
 
 </div>
 
@@ -62,7 +66,7 @@ The agent operates an **8-node distributed production environment** in real-time
 
 ---
 
-## 🏭 The Industry Problem Nobody Is Solving
+## The Industry Problem Nobody Is Solving
 
 Infrastructure automation is one of the most consequential unsolved problems in applied AI. The gap between where the industry is and where it needs to be is enormous.
 
@@ -113,9 +117,13 @@ The reward engine — `ProductionSREReward` — bounds all signals to `[−5.0, 
 | **Action efficiency** | `[−0.5, +0.5]` | Avoiding redundant or no-op commands |
 | **Temporal friction** | `[−0.5, +0.5]` | Penalizing thrashing and oscillation |
 
+<p align="center">
+  <img src="frontend/public/ui/sti.jpg" alt="How the simulation works" width="100%" />
+</p>
+
 ---
 
-## 💥 14 Failure Scenarios
+##  14 Failure Scenarios
 
 The environment spans a full spectrum of real-world production failure modes:
 
@@ -128,7 +136,7 @@ The environment spans a full spectrum of real-world production failure modes:
 
 ---
 
-## ⚖️ DIME as a Standardized SRE Benchmark
+## DIME as a Standardized SRE Benchmark
 
 While DIME provides the perfect playground for RL training, its rigorous, physics-driven scoring makes it an ideal **evaluation benchmark** for future autonomous SRE agents. 
 
@@ -141,7 +149,7 @@ Any future LLM, agentic framework, or infrastructure-as-code tool can be plugged
 
 ---
 
-## 📊 Training & Results
+## Training & Results
 
 We used **Qwen3-8B-Instruct** as our baseline. To prove the environment works, we applied **GRPO** (Group Relative Policy Optimization) on top of the checkpoint using DIME as the sole teacher. 
 * *No separate value model.* * *No human-labeled data.* * *Pure environment feedback using TRL and Unsloth (FP8).*
@@ -169,9 +177,13 @@ The biggest gains emerged in the hardest scenarios, proving the model actually l
 
 **The core behavioral shift:** The fine-tuned model learned to consistently check `failed_nodes[0]` (the database) before evaluating anything else. The zero-shot baseline does not do this reliably. Learning that single priority—*check the SPOF first*—accounts for the massive improvement across all tasks.
 
+<p align="center">
+  <img src="frontend/public/ui/bench.jpg" alt="Benchmark results" width="100%" />
+</p>
+
 ---
 
-## 🚀 Running DIME
+## Running DIME
 
 To reproduce training or run your own agent against the environment, open and execute the training notebook:
 
@@ -183,7 +195,7 @@ The notebook covers environment setup, GRPO training configuration, reward funct
 
 ---
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 | Component | Role |
 |:---|:---|
@@ -197,7 +209,7 @@ The notebook covers environment setup, GRPO training configuration, reward funct
 
 ---
 
-## 🗺️ Roadmap
+## Roadmap
 
 **Near-term**
 - [ ] Expand to 50+ failure scenarios (adding a new task is one function, not a rewrite).
