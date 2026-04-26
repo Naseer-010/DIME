@@ -1,10 +1,10 @@
 "use client";
 
+import Image from "next/image";
 import { useEffect, useRef, useState } from "react";
 import { FlipWords } from "@/components/ui/FlipWords";
 import { TextGenerateEffect } from "@/components/ui/TextGenerateEffect";
 import { ClusterSimulation } from "@/components/simulation/ClusterSimulation";
-import { useSimulationSocket } from "@/lib/useSimulationSocket";
 import type { DockItem } from "@/components/ui/types";
 
 type TelemetrySnapshot = {
@@ -463,7 +463,7 @@ function RewardWeightMeter() {
   );
 }
 
-function useAnimatedFallback(): TelemetrySnapshot {
+function useAnimatedTelemetry(): TelemetrySnapshot {
   const [snapshot, setSnapshot] = useState<TelemetrySnapshot>({
     step: 0,
     cpuLoads: [0.3, 0.25, 0.4, 0.35, 0.28, 0.32, 0.38, 0.22],
@@ -480,17 +480,18 @@ function useAnimatedFallback(): TelemetrySnapshot {
       const t = step * 0.15;
       setSnapshot({
         step,
-        cpuLoads: Array.from({ length: 8 }, (_, i) =>
-          Math.max(0.05, Math.min(0.95, 0.35 + 0.25 * Math.sin(t + i * 0.8) + (Math.random() - 0.5) * 0.08))
-        ),
+        cpuLoads: Array.from({ length: 8 }, (_, i) => {
+          const load = Math.max(0.05, Math.min(0.95, 0.35 + 0.25 * Math.sin(t + i * 0.8) + (Math.random() - 0.5) * 0.06));
+          return Number(load.toFixed(2));
+        }),
         queueLengths: Array.from({ length: 8 }, (_, i) =>
-          Math.max(0, Math.round(12 + 10 * Math.sin(t * 0.7 + i) + Math.random() * 4))
+          Math.max(0, Math.round(12 + 10 * Math.sin(t * 0.7 + i) + Math.random() * 3))
         ),
-        latencyMs: Math.max(8, 35 + 20 * Math.sin(t * 0.5) + Math.random() * 8),
-        failedNodes: step % 30 > 22 && step % 30 < 28 ? [Math.floor(Math.random() * 7) + 1] : [],
-        requestRate: Math.max(50, 150 + 80 * Math.sin(t * 0.3) + Math.random() * 20),
+        latencyMs: Math.max(8, 28 + 16 * Math.sin(t * 0.5) + Math.random() * 6),
+        failedNodes: step % 40 > 30 && step % 40 < 36 ? [Math.floor(Math.random() * 7) + 1] : [],
+        requestRate: Math.max(60, 150 + 60 * Math.sin(t * 0.3) + Math.random() * 12),
       });
-    }, 500);
+    }, 600);
     return () => clearInterval(timer);
   }, []);
 
@@ -523,26 +524,8 @@ function ScrollProgress() {
 }
 
 export default function Home() {
-  const { packet, connected } = useSimulationSocket();
-  const animatedFallback = useAnimatedFallback();
+  const telemetry = useAnimatedTelemetry();
   const [showScrollCue, setShowScrollCue] = useState(true);
-
-  const telemetry: TelemetrySnapshot | null = (() => {
-    if (connected && packet?.observation) {
-      const obs = packet.observation;
-      return {
-        step: obs.step ?? 0,
-        cpuLoads: obs.cpu_loads ?? [],
-        queueLengths: obs.queue_lengths ?? [],
-        latencyMs: obs.latency_ms ?? 0,
-        failedNodes: obs.failed_nodes ?? [],
-        requestRate: obs.request_rate ?? 0,
-      };
-    }
-    return animatedFallback;
-  })();
-
-  const telemetryError: string | null = !connected ? "backend offline — showing animated preview" : null;
 
   useEffect(() => {
     const onScroll = () => {
@@ -627,9 +610,6 @@ export default function Home() {
                     </p>
                   </div>
 
-                  {telemetryError ? (
-                    <p className="mt-4 text-xs text-pink-300">telemetry warning: {telemetryError}</p>
-                  ) : null}
                 </div>
               </div>
 
@@ -664,7 +644,7 @@ export default function Home() {
           <p className="font-mono text-xs tracking-[0.2em] text-sky-300">[ REAL-TIME CLUSTER TOPOLOGY ]</p>
           <AnimatedHeading words="Watch DIME Evolve Step by Step" />
           <TextGenerateEffect
-            words="Native React Flow vectors, motion-interpolated node states, and live WebSocket telemetry from the Python simulator."
+            words="Native vector topology, motion-interpolated node states, and live-style telemetry from the Python simulator."
             className="mt-3 text-xs uppercase tracking-[0.14em] text-zinc-500 sm:text-sm"
           />
           <div className="mt-10">
@@ -731,7 +711,15 @@ export default function Home() {
           <div className="mt-12 grid grid-cols-1 gap-6 lg:grid-cols-2">
             {METRIC_FIGURES.map((figure) => (
               <article key={figure.src} className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-950/80">
-                <img src={figure.src} alt={figure.title} loading="lazy" className="h-auto w-full object-cover" />
+                <Image
+                  src={figure.src}
+                  alt={figure.title}
+                  width={1100}
+                  height={680}
+                  loading="lazy"
+                  sizes="(min-width: 1024px) 50vw, 100vw"
+                  className="h-auto w-full object-cover"
+                />
                 <div className="p-4">
                   <p className="text-base font-semibold text-white">{figure.title}</p>
                   <p className="mt-2 text-sm text-zinc-400">{figure.caption}</p>
