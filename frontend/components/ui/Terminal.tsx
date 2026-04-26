@@ -22,7 +22,7 @@ export function Terminal({
   commands,
   outputs,
   typingSpeed = 26,
-  delayBetweenCommands = 450,
+  delayBetweenCommands = 400,
   className,
 }: TerminalProps) {
   const [lines, setLines] = useState<RenderedLine[]>([]);
@@ -41,33 +41,39 @@ export function Terminal({
   }, [commands, outputs]);
 
   useEffect(() => {
-    let cancelled = false;
+    let running = true;
 
     const run = async () => {
-      setLines([]);
-      setActiveLine(null);
+      while (running) {
+        setLines([]);
+        setActiveLine(null);
 
-      for (let i = 0; i < script.length; i += 1) {
-        const line = script[i];
-        const value = line.text ?? "";
+        for (let i = 0; i < script.length; i += 1) {
+          const line = script[i];
+          const value = line.text ?? "";
 
-        for (let c = 0; c <= value.length; c += 1) {
-          if (cancelled) return;
-          setActiveLine({ type: line.type, text: value.slice(0, c) });
-          await sleep(typingSpeed);
+          for (let c = 0; c <= value.length; c += 1) {
+            if (!running) return;
+            setActiveLine({ type: line.type, text: value.slice(0, c) });
+            await sleep(typingSpeed);
+          }
+
+          if (!running) return;
+          setLines((prev) => [...prev, line]);
+          setActiveLine(null);
+          await sleep(delayBetweenCommands);
         }
 
-        if (cancelled) return;
-        setLines((prev) => [...prev, line]);
+        if (!running) return;
         setActiveLine(null);
-        await sleep(delayBetweenCommands);
+        await sleep(2500);
       }
     };
 
     run();
 
     return () => {
-      cancelled = true;
+      running = false;
     };
   }, [script, typingSpeed, delayBetweenCommands]);
 
@@ -83,7 +89,7 @@ export function Terminal({
       >
         {isCommand ? "$ " : ""}
         {line.text}
-        {active ? <span className="ml-0.5 inline-block h-4 w-2 animate-pulse bg-white/90 align-middle" /> : null}
+        {active ? <span className="ml-0.5 inline-block animate-pulse align-middle text-zinc-100">█</span> : null}
       </div>
     );
   };
