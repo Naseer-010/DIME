@@ -34,3 +34,6 @@ outputs/
 # Frontend
 frontend/node_modules/
 frontend/.next/
+*.png
+*.jpg
+*.pdf
