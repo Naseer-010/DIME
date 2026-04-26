@@ -22,9 +22,11 @@ _global_env = DistributedInfraEnvironment()
 _viz_env = DistributedInfraEnvironment()
 _viz_lock = asyncio.Lock()
 
+
 # 2. Create a "factory function" that returns our active instance
 def env_factory():
     return _global_env
+
 
 # 3. Pass the callable factory function to OpenEnv
 app = create_app(
@@ -34,16 +36,25 @@ app = create_app(
     env_name="distributed_infra_env",
 )
 
+# --- CORS for Next.js frontend ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000", "*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-#Clear formatted document page for root url
+
+# Clear formatted document page for root url
 @app.get("/")
 def home():
     # Safely locate the home.html file in the same directory as this script
     html_file_path = os.path.join(os.path.dirname(__file__), "home.html")
-    
+
     with open(html_file_path, "r", encoding="utf-8") as file:
         html_content = file.read()
-        
+
     return HTMLResponse(content=html_content)
 
 
@@ -110,7 +121,9 @@ async def simulation_socket(websocket: WebSocket):
 
                 obs = _viz_env.step(action=action)
                 if obs.done:
-                    obs = _viz_env.reset(task=_viz_env.sim.task_id or "cascading_failure")
+                    obs = _viz_env.reset(
+                        task=_viz_env.sim.task_id or "cascading_failure"
+                    )
 
                 await websocket.send_json(
                     {
@@ -126,10 +139,13 @@ async def simulation_socket(websocket: WebSocket):
     except (WebSocketDisconnect, RuntimeError):
         return
 
+
 def main():
     """Entry point for direct execution."""
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
 
 if __name__ == "__main__":
     main()
