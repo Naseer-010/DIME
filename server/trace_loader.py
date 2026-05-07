@@ -71,11 +71,11 @@ class TraceReplay:
     def __len__(self) -> int:
         return len(self._steps)
 
-    def get_step(self, step: int) -> TraceStep:
-        """Get trace data for a given step. Wraps around."""
+    def get_step(self, step: int, offset: int = 0) -> TraceStep:
+        """Get trace data for a given step plus deterministic offset. Wraps around."""
         if not self._steps:
             return TraceStep()
-        return self._steps[step % len(self._steps)]
+        return self._steps[(int(step) + int(offset)) % len(self._steps)]
 
 
 # ---------------------------------------------------------------------------

@@ -101,19 +101,10 @@ MAX_COMPLETION_LENGTH = (
 SAVE_STEPS = 100
 
 ALL_TASKS = [
+    "level_1_read_logs",
     "traffic_spike",
     "node_failure",
     "cascading_failure",
-    "flash_crowd",
-    "thundering_herd",
-    "zombie_node",
-    "hot_shard_skew",
-    "memory_leak_slow_burn",
-    "split_brain_io_bottleneck",
-    "black_swan_az_failure",
-    "retry_storm",
-    "connection_pool_deadlock",
-    "autoscaler_flapping_trap",
 ]
 
 # ---------------------------------------------------------------------------

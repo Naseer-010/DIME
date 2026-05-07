@@ -331,10 +331,11 @@ def _setup_alibaba_trace(env: "DistributedInfraEnvironment", rng: "random.Random
     trace = load_default_trace()
     if trace is not None:
         sim.trace_replay = trace
-        # Start replay from a random offset to vary episodes
-        offset = rng.randint(0, max(1, len(trace) - sim.max_steps))
-        # We store offset in step_count adjustment — trace_loader wraps around
-        sim.current_request_rate = trace.get_step(offset).request_rate
+        # Start replay from a deterministic benchmark offset when provided,
+        # otherwise preserve the existing stochastic task variation.
+        if not sim.trace_offset_locked:
+            sim.trace_offset = rng.randint(0, max(1, len(trace) - sim.max_steps))
+        sim.current_request_rate = trace.get_step(0, offset=sim.trace_offset).request_rate
     else:
         # Fallback: synthetic 2x traffic if trace not generated
         sim.current_request_rate = sim.base_request_rate * 2.0

@@ -102,10 +102,13 @@ class SimulationState:
 
     # --- Trace replay ---
     trace_replay: Any = None  # Optional[TraceReplay]
+    trace_offset: int = 0
+    trace_offset_locked: bool = False
     last_trace_p99_latency: float = 0.0
     last_trace_node_0_io: float = 0.0
     scenario: str = ""  # task-specific chaos scenario overlay
     _black_swan_applied: bool = False
+    topology_template: str = "default"
 
     # --- Throughput tracking (anti-exploit) ---
     total_requests_received: int = 0
@@ -122,15 +125,20 @@ class SimulationState:
 # ---------------------------------------------------------------------------
 
 
-def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
-    """Create a default graph with node roles: node 0 = Database, rest = App Servers."""
+def _build_default_graph(
+    n: int = 8,
+    rng: Optional[random.Random] = None,
+    topology_template: str = "default",
+) -> Tuple[List[Node], Dict[int, List[int]]]:
+    """Create a constrained graph with node 0 = Database and rest = App Servers."""
+    rng = rng or random
     nodes = []
     for i in range(n):
         if i == 0:
             # Database node: higher capacity, single point of failure
             nodes.append(
                 Node(
-                    cpu_util=0.20 + random.uniform(-0.03, 0.03),
+                    cpu_util=0.20 + rng.uniform(-0.03, 0.03),
                     capacity=25,
                     role="database",
                 )
@@ -138,7 +146,7 @@ def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
         else:
             nodes.append(
                 Node(
-                    cpu_util=0.25 + random.uniform(-0.05, 0.05),
+                    cpu_util=0.25 + rng.uniform(-0.05, 0.05),
                     capacity=15,
                     role="app_server",
                 )
@@ -150,16 +158,40 @@ def _build_default_graph(n: int = 8) -> Tuple[List[Node], Dict[int, List[int]]]:
     for i in range(1, n):
         adjacency[0].append(i)
         adjacency[i].append(0)
-    # App servers: ring + skip connections among themselves
+    # App servers: deterministic constrained templates built from the same
+    # DB-star/ring physics. No arbitrary graph generation is introduced.
     for i in range(1, n):
         right = 1 + (i % (n - 1))  # wrap within app server range
         if right not in adjacency[i]:
             adjacency[i].append(right)
             adjacency[right].append(i)
+
+    if topology_template == "app_ring":
+        return nodes, adjacency
+
+    if topology_template == "sampled_mesh":
+        for i in range(1, n):
+            candidates = [j for j in range(1, n) if j != i and j not in adjacency[i]]
+            if candidates:
+                peer = rng.choice(candidates)
+                adjacency[i].append(peer)
+                adjacency[peer].append(i)
+        return nodes, adjacency
+
+    # Default and dense_mesh retain the historical skip-link shape.
+    for i in range(1, n):
+        right = 1 + (i % (n - 1))
         skip = 1 + ((i + 1) % (n - 1))
         if skip not in adjacency[i] and skip != right:
             adjacency[i].append(skip)
             adjacency[skip].append(i)
+
+    if topology_template == "dense_mesh":
+        for i in range(1, n):
+            extra = 1 + ((i + 2) % (n - 1))
+            if extra != i and extra not in adjacency[i]:
+                adjacency[i].append(extra)
+                adjacency[extra].append(i)
 
     return nodes, adjacency
 
@@ -218,6 +250,9 @@ class DistributedInfraEnvironment(Environment):
 
         task_id = kwargs.get("task", kwargs.get("task_id", "traffic_spike"))
         curriculum_level = int(kwargs.get("curriculum_level", 0))
+        topology_template = str(kwargs.get("topology_template", "default"))
+        trace_offset_arg = kwargs.get("trace_offset", None)
+        trace_offset = int(trace_offset_arg) if trace_offset_arg is not None else 0
 
         # Auto-detect curriculum level from task_id if not explicitly given
         if curriculum_level == 0:
@@ -233,7 +268,11 @@ class DistributedInfraEnvironment(Environment):
             }
             curriculum_level = _level_map.get(task_id, 2)
 
-        nodes, adjacency = _build_default_graph(8)
+        nodes, adjacency = _build_default_graph(
+            8,
+            rng=self._rng,
+            topology_template=topology_template,
+        )
         self._sim = SimulationState(
             nodes=nodes,
             adjacency=adjacency,
@@ -250,6 +289,9 @@ class DistributedInfraEnvironment(Environment):
             curriculum_level=curriculum_level,
             cloud_budget=max(5, 15 - curriculum_level * 2),  # harder = tighter budget
             error_budget=100.0,
+            trace_offset=trace_offset,
+            trace_offset_locked=trace_offset_arg is not None,
+            topology_template=topology_template,
         )
 
         # Apply task-specific setup
@@ -488,7 +530,7 @@ class DistributedInfraEnvironment(Environment):
 
         # --- Trace replay: override request rate from real data ---
         if sim.trace_replay is not None:
-            trace_step = sim.trace_replay.get_step(sim.step_count)
+            trace_step = sim.trace_replay.get_step(sim.step_count, offset=sim.trace_offset)
             sim.current_request_rate = trace_step.request_rate
             sim.last_trace_p99_latency = float(
                 getattr(trace_step, "p99_latency", 0.0) or 0.0
