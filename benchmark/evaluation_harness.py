@@ -18,7 +18,13 @@ from benchmark.benchmark_config import BenchmarkConfig, DIME_V1_CONFIG
 from benchmark.benchmark_registry import Split, TaskSpec, get_benchmark_task_specs
 from benchmark.deterministic import set_global_seed
 from benchmark.dime_index import compute_dime_index, select_latency_normalization
+from benchmark.hidden_eval_registry import hidden_registry_snapshot
+from benchmark.reward_telemetry import (
+    build_reward_telemetry,
+    evaluate_reward_normalization,
+)
 from benchmark.statistical_report import build_statistical_report, persist_statistical_report
+from benchmark.statistical_report import compare_agent_runs, summarize_run_for_leaderboard
 from benchmark.utils import (
     BENCHMARK_RUNS_DIR,
     SEED_LOGS_DIR,
@@ -236,7 +242,7 @@ def _run_episode(
     seed: int,
     *,
     run_dir: Path,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     set_global_seed(seed)
     _reset_agent(agent, seed=seed, task_id=spec.task_id)
     env = DistributedInfraEnvironment()
@@ -246,14 +252,19 @@ def _run_episode(
         {"event": "reset", "seed": seed, "task_id": spec.task_id, "registry_id": spec.registry_id, "observation": observation_to_dict(obs)}
     ]
     rewards: list[float] = []
+    reward_breakdown_records: list[dict[str, Any]] = []
+    action_types: list[str] = []
     task_score = float(getattr(obs, "task_score", 0.0) or 0.0)
     start = time.perf_counter()
 
     while True:
         action = _coerce_action(agent.act(obs))
+        action_types.append(action.action_type)
         obs = env.step(action)
         obs_dict = observation_to_dict(obs)
         reward = float(obs_dict.get("reward", 0.0) or 0.0)
+        rubric_breakdown = env.rubric_breakdown
+        pbrs_components = env.pbrs_components
         rewards.append(reward)
         task_score = float(obs_dict.get("task_score", task_score) or task_score)
         trajectory.append(
@@ -262,9 +273,23 @@ def _run_episode(
                 "step": obs_dict.get("step"),
                 "action": action_to_dict(action),
                 "reward": reward,
+                "rubric_breakdown": rubric_breakdown,
+                "pbrs_components": pbrs_components,
                 "done": bool(obs_dict.get("done", False)),
                 "task_score": task_score,
                 "observation": obs_dict,
+            }
+        )
+        reward_breakdown_records.append(
+            {
+                "benchmark_version": DIME_V1_CONFIG.benchmark_version,
+                "registry_id": spec.registry_id,
+                "task_id": spec.task_id,
+                "split": spec.split.value,
+                "seed": seed,
+                "step": obs_dict.get("step"),
+                "rubric_breakdown": rubric_breakdown,
+                "pbrs_components": pbrs_components,
             }
         )
         if bool(obs_dict.get("done", False)) or env.sim.step_count >= env.sim.max_steps:
@@ -287,16 +312,82 @@ def _run_episode(
         "steps": env.sim.step_count,
         "elapsed_s": round(elapsed_s, 6),
         "trajectory_path": str(raw_path),
+        "trajectory_signature": ",".join(action_types),
         **metrics,
     }
     atomic_write_json(seed_log_path, row)
-    return row
+    return row, reward_breakdown_records
+
+
+def _mean(values: list[float]) -> float:
+    return sum(values) / len(values) if values else 0.0
+
+
+def _detect_memorization(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Heuristic memorization warnings for official benchmark reports."""
+    warnings: list[dict[str, Any]] = []
+    if not rows:
+        return warnings
+
+    signatures = {str(row.get("trajectory_signature", "")) for row in rows}
+    diversity = len(signatures) / max(1, len(rows))
+    if diversity < 0.10:
+        warnings.append(
+            {
+                "type": "low_trajectory_diversity",
+                "severity": "warning",
+                "trajectory_diversity": round(diversity, 6),
+                "message": "Trajectory diversity is abnormally low across seeds/tasks.",
+            }
+        )
+
+    sorted_rows = sorted(rows, key=lambda row: int(row.get("seed", 0)))
+    midpoint = len(sorted_rows) // 2
+    if midpoint > 0:
+        early = _mean([float(row.get("dime_index", 0.0)) for row in sorted_rows[:midpoint]])
+        late = _mean([float(row.get("dime_index", 0.0)) for row in sorted_rows[midpoint:]])
+        if early - late > 0.25:
+            warnings.append(
+                {
+                    "type": "seed_shift_collapse",
+                    "severity": "warning",
+                    "early_seed_mean": round(early, 6),
+                    "late_seed_mean": round(late, 6),
+                    "message": "Performance collapses under later benchmark seed shifts.",
+                }
+            )
+
+    default_scores = [
+        float(row.get("dime_index", 0.0))
+        for row in rows
+        if row.get("topology_template") == "default"
+    ]
+    perturbed_scores = [
+        float(row.get("dime_index", 0.0))
+        for row in rows
+        if row.get("topology_template") != "default"
+    ]
+    if default_scores and perturbed_scores:
+        default_mean = _mean(default_scores)
+        perturbed_mean = _mean(perturbed_scores)
+        if default_mean - perturbed_mean > 0.25:
+            warnings.append(
+                {
+                    "type": "topology_perturbation_collapse",
+                    "severity": "warning",
+                    "default_topology_mean": round(default_mean, 6),
+                    "perturbed_topology_mean": round(perturbed_mean, 6),
+                    "message": "Performance collapses under topology perturbation.",
+                }
+            )
+    return warnings
 
 
 def run_benchmark(
     agent: str | BaseAgent | Callable[[Any], Any],
     benchmark_version: str = "DIME-v1.0",
     split: str = "hidden_eval",
+    reward_ablations: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Run the official DIME benchmark and persist all artifacts."""
     if benchmark_version != DIME_V1_CONFIG.benchmark_version:
@@ -304,6 +395,7 @@ def run_benchmark(
 
     ensure_result_dirs()
     active_agent = _resolve_agent(agent)
+    agent_name = agent if isinstance(agent, str) else active_agent.__class__.__name__
     split_value = Split(split)
     specs = get_benchmark_task_specs(split_value)
     config = DIME_V1_CONFIG
@@ -314,18 +406,33 @@ def run_benchmark(
     run_id = utc_run_id(f"{benchmark_version}_{split_value.value}")
     run_dir = BENCHMARK_RUNS_DIR / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(run_dir / "benchmark_config.initial.json", _config_snapshot(config))
+    initial_snapshot = _config_snapshot(config)
+    if split_value is Split.HIDDEN_EVAL:
+        initial_snapshot["hidden_eval_registry"] = hidden_registry_snapshot(official=True)
+    atomic_write_json(run_dir / "benchmark_config.initial.json", initial_snapshot)
 
     episode_rows: list[dict[str, Any]] = []
+    reward_breakdowns: list[dict[str, Any]] = []
     with _inference_only(active_agent):
         for spec in specs:
             for seed in seeds:
-                episode_rows.append(_run_episode(active_agent, spec, seed, run_dir=run_dir))
+                row, breakdown_records = _run_episode(active_agent, spec, seed, run_dir=run_dir)
+                episode_rows.append(row)
+                reward_breakdowns.extend(breakdown_records)
 
     latency_selection = select_latency_normalization(episode_rows)
     selected_method = latency_selection["selected_method"]
     final_config_snapshot = _config_snapshot(config, selected_method)
+    if split_value is Split.HIDDEN_EVAL:
+        final_config_snapshot["hidden_eval_registry"] = hidden_registry_snapshot(official=True)
     final_config_snapshot["latency_method_selection"] = latency_selection
+    reward_selection = evaluate_reward_normalization(reward_breakdowns)
+    reward_telemetry = build_reward_telemetry(
+        reward_breakdowns,
+        reward_selection,
+        ablations=tuple(reward_ablations),
+    )
+    final_config_snapshot["reward_normalization"] = reward_telemetry["normalization"]
 
     scored_rows: list[dict[str, Any]] = []
     for row in episode_rows:
@@ -333,8 +440,10 @@ def run_benchmark(
         scored_rows.append({**row, **score_payload})
 
     report = build_statistical_report(scored_rows)
+    memorization_warnings = _detect_memorization(scored_rows)
     summary = {
         "run_id": run_id,
+        "agent_name": agent_name,
         "benchmark_version": benchmark_version,
         "split": split_value.value,
         "episodes_per_task": config.evaluation_protocol.episodes_per_task,
@@ -342,13 +451,28 @@ def run_benchmark(
         "num_episodes": len(scored_rows),
         "selected_latency_method": selected_method,
         "latency_method_selection": latency_selection,
+        "reward_normalization": reward_telemetry["normalization"],
+        "reward_dominance_flags": reward_telemetry["dominance"],
+        "reward_ablation_report": reward_telemetry["ablation_report"],
+        "memorization_warnings": memorization_warnings,
         "mean_dime_index": report["episodes"]["dime_index"]["mean"],
+        "mean_uptime": report["episodes"]["uptime"]["mean"],
+        "mean_latency_score": report["episodes"]["latency_score"]["mean"],
+        "mean_throughput": report["episodes"]["throughput"]["mean"],
+        "mean_recovery_speed": report["episodes"]["recovery_speed"]["mean"],
+        "mean_cost_efficiency": report["episodes"]["cost_efficiency"]["mean"],
+        "mean_reward": report["episodes"]["cumulative_reward"]["mean"],
+        "std_reward": report["episodes"]["cumulative_reward"]["std"],
+        "success_rate": report["episodes"]["task_success"]["mean"],
         "artifact_dir": str(run_dir),
     }
 
     atomic_write_json(run_dir / "benchmark_config.snapshot.json", final_config_snapshot)
     atomic_write_json(run_dir / "benchmark_summary.json", summary)
     atomic_write_json(run_dir / "episode_metrics.json", scored_rows)
+    atomic_write_json(run_dir / "reward_telemetry.json", reward_telemetry)
+    atomic_write_json(run_dir / "ablation_report.json", reward_telemetry["ablation_report"])
+    append_jsonl(run_dir / "reward_breakdowns.jsonl", reward_breakdowns)
     write_csv(
         run_dir / "episode_metrics.csv",
         scored_rows,
@@ -390,8 +514,34 @@ def main() -> None:
     parser.add_argument("--agent", default="heuristic", help="random, heuristic, threshold, or an HTTP endpoint")
     parser.add_argument("--split", default="hidden_eval", choices=[split.value for split in Split])
     parser.add_argument("--benchmark-version", default="DIME-v1.0")
+    parser.add_argument("--reward-ablation", action="append", default=[], help="Verifier to ablate in telemetry reports")
+    parser.add_argument("--compare-runs", nargs="+", default=None, help="Compare existing benchmark run directories")
+    parser.add_argument("--leaderboard", default=None, help="Generate leaderboard rows from a benchmark_runs directory")
     args = parser.parse_args()
-    result = run_benchmark(args.agent, benchmark_version=args.benchmark_version, split=args.split)
+
+    if args.compare_runs:
+        result = compare_agent_runs(args.compare_runs)
+        print(result)
+        return
+
+    if args.leaderboard:
+        root = Path(args.leaderboard)
+        summaries = [
+            summarize_run_for_leaderboard(path)
+            for path in sorted(root.iterdir())
+            if (path / "episode_metrics.json").exists()
+        ]
+        from benchmark.statistical_report import build_leaderboard_rows
+
+        print(build_leaderboard_rows(summaries))
+        return
+
+    result = run_benchmark(
+        args.agent,
+        benchmark_version=args.benchmark_version,
+        split=args.split,
+        reward_ablations=args.reward_ablation,
+    )
     print(result["summary"])
 
 

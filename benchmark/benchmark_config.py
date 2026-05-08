@@ -80,7 +80,7 @@ _NORMALIZATION_METHOD = MappingProxyType(
 DIME_V1_CONFIG = BenchmarkConfig(
     benchmark_name="DIME",
     benchmark_version="DIME-v1.0",
-    task_registry=MappingProxyType(dict(task_registry_snapshot(include_hidden=True))),
+    task_registry=MappingProxyType(dict(task_registry_snapshot(include_hidden=False))),
     evaluation_protocol=EvaluationProtocol(
         episodes_per_task=100,
         seeds=tuple(range(100)),

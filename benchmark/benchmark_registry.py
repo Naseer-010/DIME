@@ -26,15 +26,25 @@ class TaskSpec:
     topology_template: str = "default"
     trace_offset: int = 0
     tags: tuple[str, ...] = field(default_factory=tuple)
+    topology_seed: int | None = None
+    traffic_burst_step: int | None = None
+    failure_step: int | None = None
 
     @property
     def reset_kwargs(self) -> dict[str, object]:
-        return {
+        kwargs: dict[str, object] = {
             "task": self.task_id,
             "curriculum_level": self.curriculum_level,
             "topology_template": self.topology_template,
             "trace_offset": self.trace_offset,
         }
+        if self.topology_seed is not None:
+            kwargs["topology_seed"] = self.topology_seed
+        if self.traffic_burst_step is not None:
+            kwargs["traffic_burst_step"] = self.traffic_burst_step
+        if self.failure_step is not None:
+            kwargs["failure_step"] = self.failure_step
+        return kwargs
 
 
 TRAIN_TASKS: tuple[TaskSpec, ...] = (
@@ -50,18 +60,6 @@ VALIDATION_TASKS: tuple[TaskSpec, ...] = (
     TaskSpec("validation.zombie_node", "zombie_node", Split.VALIDATION, 5, trace_offset=41),
     TaskSpec("validation.hot_shard_skew", "hot_shard_skew", Split.VALIDATION, 5, trace_offset=73),
 )
-
-_HIDDEN_EVAL_TASKS: tuple[TaskSpec, ...] = (
-    TaskSpec("hidden.retry_storm.default.011", "retry_storm", Split.HIDDEN_EVAL, 5, "default", 11, ("trace",)),
-    TaskSpec("hidden.black_swan.default.029", "black_swan_az_failure", Split.HIDDEN_EVAL, 5, "default", 29, ("trace",)),
-    TaskSpec("hidden.connection_pool.default.053", "connection_pool_deadlock", Split.HIDDEN_EVAL, 5, "default", 53, ("trace",)),
-    TaskSpec("hidden.autoscaler.default.089", "autoscaler_flapping_trap", Split.HIDDEN_EVAL, 5, "default", 89, ("trace",)),
-    TaskSpec("hidden.retry_storm.ring.137", "retry_storm", Split.HIDDEN_EVAL, 5, "app_ring", 137, ("topology_variant", "trace")),
-    TaskSpec("hidden.black_swan.dense.211", "black_swan_az_failure", Split.HIDDEN_EVAL, 5, "dense_mesh", 211, ("topology_variant", "trace")),
-    TaskSpec("hidden.connection_pool.ring.307", "connection_pool_deadlock", Split.HIDDEN_EVAL, 5, "app_ring", 307, ("topology_variant", "trace")),
-    TaskSpec("hidden.autoscaler.sampled.401", "autoscaler_flapping_trap", Split.HIDDEN_EVAL, 5, "sampled_mesh", 401, ("topology_variant", "trace")),
-)
-
 
 def get_training_task_ids() -> tuple[str, ...]:
     """Return only tasks permitted for RL training."""
@@ -82,18 +80,22 @@ def get_benchmark_task_specs(split: Split | str) -> tuple[TaskSpec, ...]:
     """Return task specs for the official evaluation harness."""
     split_value = Split(split)
     if split_value is Split.HIDDEN_EVAL:
-        return _HIDDEN_EVAL_TASKS
+        from benchmark.hidden_eval_registry import get_hidden_eval_specs
+
+        return get_hidden_eval_specs(official=True)
     return get_public_task_specs(split_value)
 
 
-def task_registry_snapshot(include_hidden: bool = True) -> Mapping[str, tuple[str, ...]]:
+def task_registry_snapshot(include_hidden: bool = False) -> Mapping[str, tuple[str, ...]]:
     """Immutable split-to-registry-id snapshot for benchmark configs."""
     snapshot: dict[str, tuple[str, ...]] = {
         Split.TRAIN.value: tuple(task.registry_id for task in TRAIN_TASKS),
         Split.VALIDATION.value: tuple(task.registry_id for task in VALIDATION_TASKS),
     }
     if include_hidden:
-        snapshot[Split.HIDDEN_EVAL.value] = tuple(task.registry_id for task in _HIDDEN_EVAL_TASKS)
+        from benchmark.hidden_eval_registry import hidden_registry_snapshot
+
+        snapshot[Split.HIDDEN_EVAL.value] = hidden_registry_snapshot(official=True)
     return snapshot
 
 
@@ -102,4 +104,6 @@ def iter_all_specs(include_hidden: bool = True) -> Iterable[TaskSpec]:
     yield from TRAIN_TASKS
     yield from VALIDATION_TASKS
     if include_hidden:
-        yield from _HIDDEN_EVAL_TASKS
+        from benchmark.hidden_eval_registry import get_hidden_eval_specs
+
+        yield from get_hidden_eval_specs(official=True)

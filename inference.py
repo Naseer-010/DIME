@@ -35,6 +35,8 @@ from typing import List, Optional, Tuple
 import requests
 from dotenv import load_dotenv
 
+from agents.triage import CANONICAL_TRIAGE_TREE
+
 load_dotenv()
 
 # ---------------------------------------------------------------------------
@@ -69,7 +71,7 @@ _model = None
 _client = None
 _direct_env = None
 
-SYSTEM_PROMPT = """You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
+SYSTEM_PROMPT = f"""You are an expert Site Reliability Engineer (SRE) managing a highly volatile Kubernetes cluster.
 You receive telemetry as JSON and must respond with a SINGLE kubectl command to prevent cascading failure.
 
 CLUSTER ARCHITECTURE & PHYSICS:
@@ -87,42 +89,12 @@ Available commands:
 - kubectl logs node-<ID>                 → investigate telemetry timeout
 - no_op                                  → do nothing
 
-CRITICAL INCIDENT TRIAGE TREE (Follow strictly in order):
-1. OOM IMMINENT (Memory Leak): IF ANY 'mem_utilizations' > 0.92:
-   IMMEDIATELY output: kubectl delete pod node-5 (or whichever node is leaking. Scaling does NOT fix memory leaks!)
-
-2. DB RECOVERY: IF node-0 is in 'failed_nodes':
-   Output: kubectl delete pod node-0
-   (The DB is a SPOF. If it's dead, ALL other actions are futile until it restarts.)
-
-3. SPLIT-BRAIN (Disk I/O Bottleneck): IF node_0 'io_wait' > 0.80:
-   Output: kubectl throttle ingress --rate=0.5 (Do NOT scale up; more workers will lock the DB disk further).
-
-4. HOT SHARD (Load Balancer Skew): IF one worker's CPU > 0.90 but the cluster average is low:
-   Output: kubectl exec -it istio-proxy -- traffic shift --from=<high_cpu_node> --to=<low_cpu_node>
-
-5. RETRY STORM / THUNDERING HERD: IF 'p99_latency' > 100.0 AND traffic is spiking:
-   Output: kubectl throttle ingress --rate=0.4 (Break the exponential retry loop).
-
-6. CONNECTION DEADLOCK (Zombie Node): IF a worker's CPU is incredibly low (< 0.10) BUT 'p99_latency' is huge:
-   Output: kubectl exec -it istio-proxy -- traffic shift --from=<zombie_node> --to=<healthy_node>
-
-7. BLACK SWAN (Multi-Node Death): IF multiple nodes are in 'failed_nodes' (but DB is alive):
-   Output: kubectl throttle ingress --rate=0.3 (Shed load to protect survivors while you recover).
-
-8. DATABASE SURVIVAL: IF node-0 (DB) cpu_load > 0.80:
-   Output: kubectl throttle ingress --rate=0.7
-
-9. SAFE SCALING: IF avg worker CPU > 0.75 AND 'error_budget' > 20:
-   Output: kubectl scale deployment frontend --replicas=10
-
-10. HEALTHY / FLAPPING TRAP: If metrics are stable or oscillating slightly:
-   Output: no_op
+{CANONICAL_TRIAGE_TREE}
 
 Respond using the following STRICT format. You must include the XML reasoning tags:
 <reasoning>Diagnose the telemetry. Identify which of the 10 Triage rules applies.</reasoning>
 <action>
-{"command": "your_kubectl_command_or_no_op_here"}
+{{"command": "your_kubectl_command_or_no_op_here"}}
 </action>"""
 
 

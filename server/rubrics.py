@@ -110,10 +110,19 @@ class SafeSliceLatencyVerifier:
 @dataclass
 class CascadePBRSVerifier:
     """
-    Potential-Based Reward Shaping for cluster stress with Velocity penalty.
+    Potential-Based Reward Shaping for cluster stress plus a separate velocity penalty.
 
-    Rewards reduction in overload stress between consecutive states while
-    penalizing rapid load oscillation (velocity) to stop "loop-and-farm" exploits.
+    Formal shaping term:
+
+        F(s, a, s') = gamma * Phi(s') - Phi(s)
+
+    where Phi(s) is negative weighted cluster stress. Under the standard PBRS
+    assumptions that state transitions are Markovian, gamma matches the task
+    discount, and Phi depends only on observable simulator state, this shaping
+    term preserves optimal policies. The velocity penalty below is deliberately
+    reported and subtracted as a separate regularizer; it is not part of the
+    policy-invariant PBRS proof and exists only to discourage oscillatory
+    "loop-and-farm" behavior.
     """
 
     name: str = "cascade_pbrs"
@@ -121,13 +130,27 @@ class CascadePBRSVerifier:
     beta_stress: float = 10.0
     gamma: float = 0.99
     lambda_velocity: float = 2.0
+    w_cpu: float = 1.0
+    w_queue: float = 0.35
+    w_memory: float = 0.75
+    w_failed: float = 1.5
 
     def _potential(self, nodes: List["Node"]) -> float:
-        stress = sum(
-            max(0.0, n.cpu_util - self.tau_stress) ** 2
-            for n in nodes
-            if not n.is_failed
-        )
+        if not nodes:
+            return 0.0
+        stress = 0.0
+        for node in nodes:
+            if node.is_failed:
+                stress += self.w_failed
+                continue
+            cpu_stress = max(0.0, node.cpu_util - self.tau_stress) ** 2
+            queue_stress = min(1.0, max(0.0, node.queue_length) / max(1.0, node.capacity * 4.0)) ** 2
+            memory_stress = max(0.0, node.memory_util - 0.80) ** 2
+            stress += (
+                self.w_cpu * cpu_stress
+                + self.w_queue * queue_stress
+                + self.w_memory * memory_stress
+            )
         return -self.beta_stress * stress
 
     def score(self, sim: "SimulationState") -> float:
@@ -136,6 +159,13 @@ class CascadePBRSVerifier:
         # If no previous load data, initialize and return 0
         if not getattr(sim, "prev_node_loads", None):
             sim.prev_potential = current_potential
+            sim.last_pbrs_components = {
+                "potential_previous": current_potential,
+                "potential_current": current_potential,
+                "pbrs_component": 0.0,
+                "velocity_penalty": 0.0,
+                "total": 0.0,
+            }
             return 0.0
 
         current_loads = [n.cpu_util for n in sim.nodes]
@@ -148,11 +178,16 @@ class CascadePBRSVerifier:
         )
 
         prev_pot = getattr(sim, "prev_potential", current_potential)
-        reward = (
-            (self.gamma * current_potential)
-            - prev_pot
-            - (self.lambda_velocity * velocity)
-        )
+        pbrs_component = (self.gamma * current_potential) - prev_pot
+        velocity_penalty = self.lambda_velocity * velocity
+        reward = pbrs_component - velocity_penalty
+        sim.last_pbrs_components = {
+            "potential_previous": round(prev_pot, 6),
+            "potential_current": round(current_potential, 6),
+            "pbrs_component": round(pbrs_component, 6),
+            "velocity_penalty": round(velocity_penalty, 6),
+            "total": round(reward, 6),
+        }
 
         # Set current potential for the next step calculation
         sim.prev_potential = current_potential

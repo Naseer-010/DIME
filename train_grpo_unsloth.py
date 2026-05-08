@@ -64,6 +64,7 @@ from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 from server.command_parser import parse_command, CommandParseError
 from server.rubrics import calculate_step_reward as _calculate_step_reward
+from agents.triage import expected_triage_command
 
 
 def _probe_rubrics() -> bool:
@@ -157,79 +158,8 @@ Respond in this exact format:
 
 
 def _get_expected_action(obs: dict) -> str:
-    """Return the kubectl command the triage tree mandates, or 'no_op'.
-
-    Rule ordering is critical for RL convergence:
-      1. OOM — immediate life-or-death
-      2. DB Recovery — SPOF must be restored before anything else
-      3-6. Network/traffic rules
-      7. Black Swan — only fires if DB is alive
-      8-9. Proactive scaling
-      10. Healthy
-    """
-    cpu = obs.get("cpu_loads", [0.3] * 8)
-    mem = obs.get("mem_utilizations", [0.2] * 8)
-    fail = set(obs.get("failed_nodes", []))
-    io = float(obs.get("io_wait", 0.0))
-    p99 = float(obs.get("p99_latency", 0.0))
-    rr = float(obs.get("request_rate", 100.0))
-    bud = float(obs.get("error_budget", 100.0))
-
-    # Rule 1: OOM — instant kill prevention
-    for i, m in enumerate(mem):
-        if float(m) > 0.92:
-            return f"kubectl delete pod node-{i}"
-
-    # Rule 2: DB RECOVERY — the DB is a SPOF; if it's dead, nothing else matters
-    if 0 in fail:
-        return "kubectl delete pod node-0"
-
-    # Rule 3: Split-brain
-    if io > 0.80:
-        return "kubectl throttle ingress --rate=0.5"
-
-    # Rule 4: Hot shard
-    workers = [(i, float(c)) for i, c in enumerate(cpu[1:], 1) if float(c) >= 0]
-    if workers:
-        avg = sum(c for _, c in workers) / len(workers)
-        for i, c in workers:
-            if c > 0.90 and avg < 0.60:
-                dst = min(
-                    (j for j, d in workers if j != i and j not in fail),
-                    key=lambda j: float(cpu[j]),
-                    default=None,
-                )
-                if dst is not None:
-                    return f"kubectl exec -it istio-proxy -- traffic shift --from={i} --to={dst}"
-
-    # Rule 5: Retry storm
-    if p99 > 100.0 and rr > 150:
-        return "kubectl throttle ingress --rate=0.4"
-
-    # Rule 6: Zombie node
-    for i, c in workers:
-        if 0 <= c < 0.10 and p99 > 100.0:
-            dst = next(
-                (j for j, d in workers if d > 0.2 and j not in fail and j != i),
-                None,
-            )
-            if dst is not None:
-                return f"kubectl exec -it istio-proxy -- traffic shift --from={i} --to={dst}"
-
-    # Rule 7: Black swan (only fires when DB is alive — DB recovery is above)
-    if len(fail) >= 2:
-        return "kubectl throttle ingress --rate=0.3"
-
-    # Rule 8: DB survival (protect a living DB under load)
-    db_cpu = float(cpu[0]) if cpu and float(cpu[0]) >= 0 else 0.0
-    if db_cpu > 0.80:
-        return "kubectl throttle ingress --rate=0.7"
-
-    # Rule 9: Safe scaling
-    if workers and sum(c for _, c in workers) / len(workers) > 0.75 and bud > 20:
-        return "kubectl scale deployment frontend --replicas=10"
-
-    return "no_op"
+    """Return the shared canonical triage command for an observation."""
+    return expected_triage_command(obs)
 
 
 # ---------------------------------------------------------------------------

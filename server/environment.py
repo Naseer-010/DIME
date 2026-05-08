@@ -118,6 +118,10 @@ class SimulationState:
     prev_node_loads: List[float] = field(default_factory=list)
     prev_active_nodes: int = 8
     prev_potential: float = 0.0
+    last_pbrs_components: Dict[str, float] = field(default_factory=dict)
+    topology_seed: Optional[int] = None
+    traffic_burst_step: Optional[int] = None
+    failure_step: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +257,9 @@ class DistributedInfraEnvironment(Environment):
         topology_template = str(kwargs.get("topology_template", "default"))
         trace_offset_arg = kwargs.get("trace_offset", None)
         trace_offset = int(trace_offset_arg) if trace_offset_arg is not None else 0
+        topology_seed_arg = kwargs.get("topology_seed", None)
+        topology_seed = int(topology_seed_arg) if topology_seed_arg is not None else None
+        graph_rng = self._rng if topology_seed is None else random.Random((seed or 0) + topology_seed)
 
         # Auto-detect curriculum level from task_id if not explicitly given
         if curriculum_level == 0:
@@ -270,7 +277,7 @@ class DistributedInfraEnvironment(Environment):
 
         nodes, adjacency = _build_default_graph(
             8,
-            rng=self._rng,
+            rng=graph_rng,
             topology_template=topology_template,
         )
         self._sim = SimulationState(
@@ -292,6 +299,17 @@ class DistributedInfraEnvironment(Environment):
             trace_offset=trace_offset,
             trace_offset_locked=trace_offset_arg is not None,
             topology_template=topology_template,
+            topology_seed=topology_seed,
+            traffic_burst_step=(
+                int(kwargs["traffic_burst_step"])
+                if kwargs.get("traffic_burst_step") is not None
+                else None
+            ),
+            failure_step=(
+                int(kwargs["failure_step"])
+                if kwargs.get("failure_step") is not None
+                else None
+            ),
         )
 
         # Apply task-specific setup
@@ -386,6 +404,16 @@ class DistributedInfraEnvironment(Environment):
     @property
     def state(self) -> InfraState:
         return self._state
+
+    @property
+    def rubric_breakdown(self) -> Dict[str, float]:
+        """Latest composable rubric breakdown for benchmark telemetry."""
+        return dict(getattr(self, "_last_rubric_breakdown", {}) or {})
+
+    @property
+    def pbrs_components(self) -> Dict[str, float]:
+        """Latest PBRS component details for benchmark telemetry."""
+        return dict(getattr(self._sim, "last_pbrs_components", {}) or {})
 
     # ----- Action handlers -----
 
@@ -1053,7 +1081,11 @@ class DistributedInfraEnvironment(Environment):
 
         # --- Retry storm: if tail latency crosses threshold, traffic doubles next step ---
         if scenario in {"retry_storm", "thundering_herd"}:
-            if sim.last_trace_p99_latency > 50.0 or sim.latency_ms > 50.0:
+            burst_due = (
+                sim.traffic_burst_step is not None
+                and sim.step_count >= sim.traffic_burst_step
+            )
+            if burst_due or sim.last_trace_p99_latency > 50.0 or sim.latency_ms > 50.0:
                 sim.current_request_rate *= 2.0
                 for n in sim.nodes:
                     if not n.is_failed and n.restart_countdown == 0:
@@ -1116,7 +1148,8 @@ class DistributedInfraEnvironment(Environment):
 
         # --- Black swan: correlated AZ failure at step 3 ---
         if scenario == "black_swan_az_failure" and not sim._black_swan_applied:
-            if sim.step_count >= 3:
+            failure_step = sim.failure_step if sim.failure_step is not None else 3
+            if sim.step_count >= failure_step:
                 dead = [1, 2, 3, 4]
                 for idx in dead:
                     if idx < len(sim.nodes):
