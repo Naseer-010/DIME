@@ -5,7 +5,7 @@ from server.environment import DistributedInfraEnvironment
 from server.models import InfraAction, InfraObservation
 
 
-def test_task(task_id: str):
+def _smoke_task(task_id: str):
     print(f"\n--- Testing task: {task_id} ---")
     env = DistributedInfraEnvironment()
     obs = env.reset(seed=42, task=task_id)
@@ -615,7 +615,7 @@ def test_node_prefix_parsing():
 if __name__ == "__main__":
     # Phase 1 tasks
     for task in ["traffic_spike", "node_failure", "cascading_failure", "flash_crowd"]:
-        test_task(task)
+        _smoke_task(task)
 
     # Phase 1 feature tests
     test_rubric_breakdown()
