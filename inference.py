@@ -426,10 +426,48 @@ def parse_llm_response(text: str) -> Tuple[dict, str]:
 # ---------------------------------------------------------------------------
 # Safe Backend Action Builder
 # ---------------------------------------------------------------------------
+def _parse_kubectl_to_structured(cmd: str) -> dict:
+    """
+    Parse a kubectl command string into a structured InfraAction dict.
+
+    Uses the existing server/command_parser.py regex patterns to convert
+    LLM-generated kubectl commands into proper action fields.
+    """
+    from server.command_parser import parse_command, CommandParseError
+
+    cmd = cmd.strip()
+    if not cmd or cmd == "no_op":
+        return {"action_type": "no_op"}
+
+    try:
+        parsed_action = parse_command(cmd)
+        # Convert the InfraAction pydantic model to a plain dict
+        result = {"action_type": parsed_action.action_type}
+        if parsed_action.target is not None:
+            result["target"] = parsed_action.target
+        if parsed_action.from_node is not None:
+            result["from_node"] = parsed_action.from_node
+        if parsed_action.to_node is not None:
+            result["to_node"] = parsed_action.to_node
+        if parsed_action.rate is not None:
+            result["rate"] = parsed_action.rate
+        return result
+    except CommandParseError:
+        # If the command can't be parsed, fall back to sending it as
+        # raw_command and let the environment handle it
+        return {"action_type": "no_op", "raw_command": cmd}
+
+
 def build_safe_backend_action(action_dict: dict) -> dict:
     """
     STRICT RECONSTRUCTOR: Prevents FastAPI 422 Errors.
     Guarantees the backend only receives valid keys specified in server/models.py.
+
+    When the LLM returns a kubectl command string (e.g. via the 'command' key),
+    this function parses it into structured InfraAction fields using the
+    server/command_parser.py regex patterns, so that:
+      - trajectory_signature correctly reflects actual actions taken
+      - actions work across all code paths (direct, HTTP, benchmark harness)
     """
     if isinstance(action_dict, dict) and (
         "command" in action_dict or "raw_command" in action_dict
@@ -437,7 +475,7 @@ def build_safe_backend_action(action_dict: dict) -> dict:
         cmd = str(
             action_dict.get("command") or action_dict.get("raw_command") or "no_op"
         ).strip()
-        return {"action_type": "no_op", "raw_command": cmd}
+        return _parse_kubectl_to_structured(cmd)
 
     safe_action = {"action_type": action_dict.get("action_type", "no_op")}
     act_type = safe_action["action_type"]
@@ -468,6 +506,32 @@ def build_safe_backend_action(action_dict: dict) -> dict:
     return safe_action
 
 
+def _action_to_log_text(action_dict: object) -> str:
+    if not isinstance(action_dict, dict):
+        return "no_op"
+
+    command = action_dict.get("command") or action_dict.get("raw_command")
+    if command:
+        return str(command).strip() or "no_op"
+
+    action_type = str(action_dict.get("action_type", "no_op"))
+    if action_type in ("restart_node", "query_logs"):
+        return f"{action_type} target={action_dict.get('target', 0)}"
+    if action_type == "reroute_traffic":
+        return (
+            f"reroute_traffic from={action_dict.get('from_node', 0)} "
+            f"to={action_dict.get('to_node', 0)}"
+        )
+    if action_type == "throttle":
+        return f"throttle rate={action_dict.get('rate', 1.0)}"
+    return action_type
+
+
+def format_action_log_entry(step: object, action_dict: object) -> str:
+    """Return one compact audit-log line for the model's recent actions."""
+    return f"Step {step}: {_action_to_log_text(action_dict)}"
+
+
 # ---------------------------------------------------------------------------
 # LLM Decision Maker
 # ---------------------------------------------------------------------------
@@ -477,6 +541,7 @@ def llm_decide(
     mode: str,
     api_base: str,
     api_key: Optional[str],
+    recent_actions: Optional[List[str]] = None,
 ) -> Tuple[dict, str, str]:
     """
     Query the LLM for a decision based on the current observation.
@@ -485,7 +550,17 @@ def llm_decide(
         (action_dict, reasoning, raw_output)
     """
     obs_str = json.dumps(observation)
-    user_prompt = f"Current system state:\n{obs_str}\nRespond with the required XML and JSON format."
+    recent_actions_str = "None"
+    if recent_actions:
+        recent_actions_str = "\n".join(recent_actions[-5:])
+
+    user_prompt = (
+        "PREVIOUS ACTIONS YOU RECENTLY TOOK:\n"
+        f"{recent_actions_str}\n\n"
+        "CURRENT SYSTEM STATE:\n"
+        f"{obs_str}\n\n"
+        "Respond with the required XML and JSON format."
+    )
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -734,6 +809,7 @@ def run_task(
     latencies: List[float] = []
     uptimes: List[float] = []
     task_score = 0.0
+    action_log: List[str] = []
 
     while True:
         step += 1
@@ -748,8 +824,15 @@ def run_task(
 
         # 1. Get the action dict, reasoning, and raw output
         action_dict, reasoning, raw_output = llm_decide(
-            obs, model_name, mode, api_base, api_key
+            obs,
+            model_name,
+            mode,
+            api_base,
+            api_key,
+            recent_actions=action_log[-5:],
         )
+        obs_step = obs.get("step", step) if isinstance(obs, dict) else step
+        action_log.append(format_action_log_entry(obs_step, action_dict))
 
         # 2. Stringify for logging
         action_str = json.dumps(action_dict).replace('"', "'")
@@ -927,7 +1010,11 @@ def main():
         print(f"  STRUCTURED LOGS: {log_dir}")
         print("==================================================")
 
-        use_direct = mode == "local"
+        # Always use direct (in-process) environment access regardless of
+        # inference mode.  This decouples the LLM endpoint choice from the
+        # environment backend, so Ollama/HF endpoint inference works without
+        # needing a separate HTTP environment server running on localhost:8000.
+        use_direct = True
         for task_id in tasks:
             stats = run_task(
                 task_id,

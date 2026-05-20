@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from agents.base_agent import BaseAgent
 from benchmark.utils import observation_to_dict
-from inference import build_safe_backend_action, llm_decide
+from inference import build_safe_backend_action, format_action_log_entry, llm_decide
 from server.models import InfraAction
 
 
@@ -26,6 +26,7 @@ class LLMResearchAgent(BaseAgent):
     api_base: str = "http://localhost:11434/v1"
     api_key: str | None = "dummy_key"
     verbose: bool = False
+    action_log: list[str] = field(default_factory=list, init=False)
 
     def __post_init__(self) -> None:
         if self.mode not in {"local", "endpoint"}:
@@ -45,6 +46,7 @@ class LLMResearchAgent(BaseAgent):
         self.last_raw_output = ""
         self.last_action = {"action_type": "no_op"}
         self.last_backend_action = {"action_type": "no_op"}
+        self.action_log.clear()
 
     def act(self, observation: Any) -> InfraAction:
         obs_dict = observation_to_dict(observation)
@@ -54,9 +56,12 @@ class LLMResearchAgent(BaseAgent):
             mode=self.mode,
             api_base=self.api_base,
             api_key=self.api_key,
+            recent_actions=self.action_log[-5:],
         )
 
         safe_action = self._coerce_safe_action(action_dict)
+        current_step = obs_dict.get("step", len(self.action_log))
+        self.action_log.append(format_action_log_entry(current_step, action_dict))
         self.last_reasoning = reasoning
         self.last_raw_output = raw_output
         self.last_action = action_dict if isinstance(action_dict, dict) else {}

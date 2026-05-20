@@ -6,12 +6,15 @@ from agents.llm_agent import LLMResearchAgent
 def test_llm_agent_normalizes_observation_and_returns_safe_raw_command(monkeypatch):
     captured = {}
 
-    def fake_llm_decide(observation, model_name, mode, api_base, api_key):
+    def fake_llm_decide(
+        observation, model_name, mode, api_base, api_key, recent_actions=None
+    ):
         captured["observation"] = observation
         captured["model_name"] = model_name
         captured["mode"] = mode
         captured["api_base"] = api_base
         captured["api_key"] = api_key
+        captured["recent_actions"] = recent_actions
         return {"command": "kubectl logs node-2"}, "check telemetry", "raw-output"
 
     monkeypatch.setattr("agents.llm_agent.llm_decide", fake_llm_decide)
@@ -40,14 +43,18 @@ def test_llm_agent_normalizes_observation_and_returns_safe_raw_command(monkeypat
     assert captured["mode"] == "endpoint"
     assert captured["api_base"] == "http://example.test/v1"
     assert captured["api_key"] == "test-key"
+    assert captured["recent_actions"] == []
     assert action.action_type == "no_op"
     assert action.raw_command == "kubectl logs node-2"
     assert agent.last_reasoning == "check telemetry"
     assert agent.last_raw_output == "raw-output"
+    assert agent.action_log == ["Step 0: kubectl logs node-2"]
 
 
 def test_llm_agent_falls_back_to_no_op_for_non_dict_model_output(monkeypatch):
-    def fake_llm_decide(observation, model_name, mode, api_base, api_key):
+    def fake_llm_decide(
+        observation, model_name, mode, api_base, api_key, recent_actions=None
+    ):
         return "not an action dict", "", ""
 
     monkeypatch.setattr("agents.llm_agent.llm_decide", fake_llm_decide)
@@ -57,3 +64,40 @@ def test_llm_agent_falls_back_to_no_op_for_non_dict_model_output(monkeypatch):
 
     assert action.action_type == "no_op"
     assert action.raw_command is None
+
+
+def test_llm_agent_passes_recent_action_audit_log(monkeypatch):
+    captured_recent_actions = []
+
+    def fake_llm_decide(
+        observation, model_name, mode, api_base, api_key, recent_actions=None
+    ):
+        captured_recent_actions.append(list(recent_actions or []))
+        step = observation.get("step", 0)
+        return {"command": f"kubectl throttle ingress --rate=0.{step}"}, "", ""
+
+    monkeypatch.setattr("agents.llm_agent.llm_decide", fake_llm_decide)
+    agent = LLMResearchAgent(model_name="test-model")
+
+    agent.act({"step": 1})
+    agent.act({"step": 2})
+
+    assert captured_recent_actions == [
+        [],
+        ["Step 1: kubectl throttle ingress --rate=0.1"],
+    ]
+
+
+def test_llm_agent_reset_clears_action_audit_log(monkeypatch):
+    def fake_llm_decide(
+        observation, model_name, mode, api_base, api_key, recent_actions=None
+    ):
+        return {"command": "kubectl logs node-1"}, "", ""
+
+    monkeypatch.setattr("agents.llm_agent.llm_decide", fake_llm_decide)
+    agent = LLMResearchAgent(model_name="test-model")
+
+    agent.act({"step": 1})
+    agent.reset(seed=7, task_id="traffic_spike")
+
+    assert agent.action_log == []

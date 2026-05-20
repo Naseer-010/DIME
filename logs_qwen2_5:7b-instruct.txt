@@ -1,0 +1,28 @@
+==================================================
+  STARTING DIME EVALUATION SESSION: qwen2.5:7b-instruct
+  MODE: ENDPOINT
+  TASKS: 1
+  STRUCTURED LOGS: /home/nquzet/Codes/Projects/DIME/logs
+==================================================
+
+[START] task=traffic_spike env=distributed_infra_env model=qwen2.5:7b-instruct mode=ENDPOINT
+[INFO] Structured log: /home/nquzet/Codes/Projects/DIME/logs/qwen2_5:7b-instruct/traffic_spike_20260519T012210Z.jsonl
+[FATAL ERROR] Failed to connect to environment server for task 'traffic_spike': Failed to reset environment after 4 attempts.
+[END] success=false steps=0 score=0.000 rewards=
+
+================================================================================
+FINAL PERFORMANCE SUMMARY: qwen2.5:7b-instruct
+================================================================================
+Task Name                 | Task Score   | Uptime %     | Avg Latency (ms)
+--------------------------------------------------------------------------------
+traffic_spike             | 0.0000       | 0.0          | 0.0            
+--------------------------------------------------------------------------------
+Overall Task Completion Score : 0.0000
+Mean System Uptime            : 0.0%
+Mean System Latency           : 0.0 ms
+================================================================================
+OVERALL DIME INDEX (Higher=Better): 0.0000
+================================================================================
+Logs saved to: /home/nquzet/Codes/Projects/DIME/logs_qwen2_5:7b-instruct.txt
+Metrics saved to: /home/nquzet/Codes/Projects/DIME/metrics_qwen2_5:7b-instruct.csv
+Structured logs: /home/nquzet/Codes/Projects/DIME/logs
