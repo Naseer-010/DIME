@@ -37,3 +37,4 @@ frontend/.next/
 *.png
 *.jpg
 *.pdf
+seed_logs/
