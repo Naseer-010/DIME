@@ -1,3 +1,12 @@
+---
+title: DIME
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+pinned: false
+---
+
 <div align="center">
 
 ```text
@@ -33,9 +42,9 @@
 
 <div align="center">
 
-| 📝 Blog Post | 🎥 Demo Video | 🌐 Live Next.js Demo | 🤗 HuggingFace |
-|:---:|:---:|:---:|:---:|
-| `coming soon` | `coming soon` | `coming soon` | [Qwen3-8B-Finetuned-DIME](https://huggingface.co/Naseer-010/Qwen3-8B-Finetuned-DIME) |
+| 📝 Research Paper | 🎥 Demo Video | 🌐 Live Next.js Demo |
+|:---:|:---:|:---:|
+| [DIME.pdf](https://drive.google.com/file/d/1SIoV8-UWNWY_Dj8ltbhaz8ZAIX75Nzg2/view?usp=sharing) | [YouTube](https://youtu.be/azl4ZAgVcLI) | `coming soon` |
 
 </div>
 
