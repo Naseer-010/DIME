@@ -1,0 +1,152 @@
+{
+  "agent_name": "LLMResearchAgent",
+  "artifact_dir": "D:\\Naseer\\DIME\\results\\benchmark_runs\\DIME-v1.0_hidden_eval_20260616T194832Z",
+  "benchmark_version": "DIME-v1.0",
+  "episodes_per_task": 100,
+  "latency_method_selection": {
+    "method_scores": {
+      "inverse_minmax": {
+        "aggregate": 0.668734,
+        "ranking_consistency": 0.611054,
+        "score_smoothness": 0.979363,
+        "task_separability": 0.099114,
+        "variance_stability": 0.985407
+      },
+      "smooth_exponential": {
+        "aggregate": 0.679433,
+        "ranking_consistency": 0.612262,
+        "score_smoothness": 0.987647,
+        "task_separability": 0.153971,
+        "variance_stability": 0.963852
+      }
+    },
+    "selected_method": "smooth_exponential"
+  },
+  "mean_cost_efficiency": 0.828281,
+  "mean_dime_index": 0.614987,
+  "mean_latency_score": 0.312361,
+  "mean_recovery_speed": 0.235401,
+  "mean_reward": -193.564457,
+  "mean_throughput": 0.767217,
+  "mean_uptime": 0.791671,
+  "memorization_warnings": [],
+  "num_episodes": 800,
+  "num_tasks": 8,
+  "reward_ablation_report": {
+    "baseline_mean": -1.799788,
+    "enabled": []
+  },
+  "reward_dominance_flags": {
+    "cascade_pbrs": {
+      "dominant": true,
+      "magnitude_ratio": 1.098379,
+      "variance_share": 0.770192
+    },
+    "efficiency": {
+      "dominant": false,
+      "magnitude_ratio": 2.269993,
+      "variance_share": 0.050658
+    },
+    "format": {
+      "dominant": false,
+      "magnitude_ratio": 0.136035,
+      "variance_share": 0.024376
+    },
+    "latency": {
+      "dominant": true,
+      "magnitude_ratio": 3.279574,
+      "variance_share": 0.002542
+    },
+    "stability": {
+      "dominant": false,
+      "magnitude_ratio": 0.308389,
+      "variance_share": 0.085608
+    },
+    "throughput": {
+      "dominant": false,
+      "magnitude_ratio": 0.138553,
+      "variance_share": 0.066624
+    }
+  },
+  "reward_normalization": {
+    "candidate_scores": {
+      "smooth_sigmoid:0.5": {
+        "dominance_imbalance": 3.279574,
+        "saturation_rate": 0.185117,
+        "score": 0.755595,
+        "temporal_stability": 0.916316,
+        "variance_consistency": 0.986261
+      },
+      "smooth_sigmoid:1.0": {
+        "dominance_imbalance": 4.662951,
+        "saturation_rate": 0.139216,
+        "score": 0.748495,
+        "temporal_stability": 0.926472,
+        "variance_consistency": 0.992265
+      },
+      "smooth_sigmoid:10.0": {
+        "dominance_imbalance": 13.325576,
+        "saturation_rate": 0.068692,
+        "score": 0.738704,
+        "temporal_stability": 0.95316,
+        "variance_consistency": 0.995303
+      },
+      "smooth_sigmoid:2.0": {
+        "dominance_imbalance": 6.568165,
+        "saturation_rate": 0.119083,
+        "score": 0.740287,
+        "temporal_stability": 0.933438,
+        "variance_consistency": 0.994544
+      },
+      "smooth_sigmoid:5.0": {
+        "dominance_imbalance": 9.630477,
+        "saturation_rate": 0.082466,
+        "score": 0.739764,
+        "temporal_stability": 0.942571,
+        "variance_consistency": 0.995114
+      },
+      "tanh:0.5": {
+        "dominance_imbalance": 2.470839,
+        "saturation_rate": 0.3366,
+        "score": 0.735637,
+        "temporal_stability": 0.901792,
+        "variance_consistency": 0.972635
+      },
+      "tanh:1.0": {
+        "dominance_imbalance": 3.279574,
+        "saturation_rate": 0.185117,
+        "score": 0.755595,
+        "temporal_stability": 0.916316,
+        "variance_consistency": 0.986261
+      },
+      "tanh:10.0": {
+        "dominance_imbalance": 9.630477,
+        "saturation_rate": 0.082466,
+        "score": 0.739764,
+        "temporal_stability": 0.942571,
+        "variance_consistency": 0.995114
+      },
+      "tanh:2.0": {
+        "dominance_imbalance": 4.662951,
+        "saturation_rate": 0.139216,
+        "score": 0.748495,
+        "temporal_stability": 0.926472,
+        "variance_consistency": 0.992265
+      },
+      "tanh:5.0": {
+        "dominance_imbalance": 7.252218,
+        "saturation_rate": 0.113458,
+        "score": 0.738662,
+        "temporal_stability": 0.935443,
+        "variance_consistency": 0.994775
+      }
+    },
+    "method": "tanh",
+    "scale_factor": 1.0
+  },
+  "run_id": "DIME-v1.0_hidden_eval_20260616T194832Z",
+  "selected_latency_method": "smooth_exponential",
+  "split": "hidden_eval",
+  "std_reward": 86.71193,
+  "success_rate": 0.6725
+}

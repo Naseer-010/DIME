@@ -1,0 +1,176 @@
+{
+  "ablation_report": {
+    "baseline_mean": -1.799788,
+    "enabled": []
+  },
+  "dominance": {
+    "cascade_pbrs": {
+      "dominant": true,
+      "magnitude_ratio": 1.098379,
+      "variance_share": 0.770192
+    },
+    "efficiency": {
+      "dominant": false,
+      "magnitude_ratio": 2.269993,
+      "variance_share": 0.050658
+    },
+    "format": {
+      "dominant": false,
+      "magnitude_ratio": 0.136035,
+      "variance_share": 0.024376
+    },
+    "latency": {
+      "dominant": true,
+      "magnitude_ratio": 3.279574,
+      "variance_share": 0.002542
+    },
+    "stability": {
+      "dominant": false,
+      "magnitude_ratio": 0.308389,
+      "variance_share": 0.085608
+    },
+    "throughput": {
+      "dominant": false,
+      "magnitude_ratio": 0.138553,
+      "variance_share": 0.066624
+    }
+  },
+  "normalization": {
+    "candidate_scores": {
+      "smooth_sigmoid:0.5": {
+        "dominance_imbalance": 3.279574,
+        "saturation_rate": 0.185117,
+        "score": 0.755595,
+        "temporal_stability": 0.916316,
+        "variance_consistency": 0.986261
+      },
+      "smooth_sigmoid:1.0": {
+        "dominance_imbalance": 4.662951,
+        "saturation_rate": 0.139216,
+        "score": 0.748495,
+        "temporal_stability": 0.926472,
+        "variance_consistency": 0.992265
+      },
+      "smooth_sigmoid:10.0": {
+        "dominance_imbalance": 13.325576,
+        "saturation_rate": 0.068692,
+        "score": 0.738704,
+        "temporal_stability": 0.95316,
+        "variance_consistency": 0.995303
+      },
+      "smooth_sigmoid:2.0": {
+        "dominance_imbalance": 6.568165,
+        "saturation_rate": 0.119083,
+        "score": 0.740287,
+        "temporal_stability": 0.933438,
+        "variance_consistency": 0.994544
+      },
+      "smooth_sigmoid:5.0": {
+        "dominance_imbalance": 9.630477,
+        "saturation_rate": 0.082466,
+        "score": 0.739764,
+        "temporal_stability": 0.942571,
+        "variance_consistency": 0.995114
+      },
+      "tanh:0.5": {
+        "dominance_imbalance": 2.470839,
+        "saturation_rate": 0.3366,
+        "score": 0.735637,
+        "temporal_stability": 0.901792,
+        "variance_consistency": 0.972635
+      },
+      "tanh:1.0": {
+        "dominance_imbalance": 3.279574,
+        "saturation_rate": 0.185117,
+        "score": 0.755595,
+        "temporal_stability": 0.916316,
+        "variance_consistency": 0.986261
+      },
+      "tanh:10.0": {
+        "dominance_imbalance": 9.630477,
+        "saturation_rate": 0.082466,
+        "score": 0.739764,
+        "temporal_stability": 0.942571,
+        "variance_consistency": 0.995114
+      },
+      "tanh:2.0": {
+        "dominance_imbalance": 4.662951,
+        "saturation_rate": 0.139216,
+        "score": 0.748495,
+        "temporal_stability": 0.926472,
+        "variance_consistency": 0.992265
+      },
+      "tanh:5.0": {
+        "dominance_imbalance": 7.252218,
+        "saturation_rate": 0.113458,
+        "score": 0.738662,
+        "temporal_stability": 0.935443,
+        "variance_consistency": 0.994775
+      }
+    },
+    "method": "tanh",
+    "scale_factor": 1.0
+  },
+  "verifiers": {
+    "cascade_pbrs": {
+      "mean": -0.148084,
+      "n": 32294,
+      "negative_ratio": 0.668545,
+      "positive_ratio": 0.306651,
+      "saturation_rate": 0.2136,
+      "std": 0.553107,
+      "temporal_stability": 0.681638,
+      "variance": 0.305927
+    },
+    "efficiency": {
+      "mean": -0.775515,
+      "n": 32294,
+      "negative_ratio": 1.0,
+      "positive_ratio": 0.0,
+      "saturation_rate": 0.035177,
+      "std": 0.141852,
+      "temporal_stability": 0.969564,
+      "variance": 0.020122
+    },
+    "format": {
+      "mean": 0.030296,
+      "n": 32294,
+      "negative_ratio": 0.038397,
+      "positive_ratio": 0.961603,
+      "saturation_rate": 0.0,
+      "std": 0.098399,
+      "temporal_stability": 0.966735,
+      "variance": 0.009682
+    },
+    "latency": {
+      "mean": -0.983806,
+      "n": 32294,
+      "negative_ratio": 1.0,
+      "positive_ratio": 0.0,
+      "saturation_rate": 0.861925,
+      "std": 0.031775,
+      "temporal_stability": 0.989111,
+      "variance": 0.00101
+    },
+    "stability": {
+      "mean": 0.14429,
+      "n": 32294,
+      "negative_ratio": 0.0,
+      "positive_ratio": 0.379761,
+      "saturation_rate": 0.0,
+      "std": 0.184402,
+      "temporal_stability": 0.956525,
+      "variance": 0.034004
+    },
+    "throughput": {
+      "mean": -0.066969,
+      "n": 32294,
+      "negative_ratio": 0.144919,
+      "positive_ratio": 0.0,
+      "saturation_rate": 0.0,
+      "std": 0.162676,
+      "temporal_stability": 0.934325,
+      "variance": 0.026464
+    }
+  }
+}
